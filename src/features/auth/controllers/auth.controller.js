@@ -33,6 +33,17 @@ export const profile = asyncHandler(async (req, res) => {
   res.json({ message: 'Profile accessed', user: req.user });
 });
 
+export const mailAuth = asyncHandler(async (req, res) => {
+  const { username, password } = req.body || {};
+
+  if (!username || !password) {
+    return res.status(400).json({ message: 'username and password are required' });
+  }
+
+  const user = await authService.authenticateForMail({ username, password });
+  res.json({ message: 'Mail credentials validated', user });
+});
+
 export const forgotPassword = asyncHandler(async (req, res) => {
   const dto = new ForgotPasswordDto(req.body);
   validateForgotPasswordInput(dto);

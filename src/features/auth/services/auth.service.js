@@ -69,6 +69,27 @@ export class AuthService {
     };
   }
 
+  async authenticateForMail({ username, password }) {
+    const user = await findUserByUsername(username);
+    if (!user) {
+      throw new AppError(404, 'User not found');
+    }
+
+    const isPasswordValid = await comparePassword(password, user.password);
+    if (!isPasswordValid) {
+      throw new AppError(401, 'Invalid credentials');
+    }
+
+    return {
+      id: user._id,
+      username: user.username,
+      fullName: user.fullName,
+      recoveryEmail: user.recoveryEmail,
+      mobile: user.mobile,
+      email: user.email || null
+    };
+  }
+
   async forgotPassword({ email }) {
     const user = await findUserByEmail(email) || await findUserByUsername(email);
     if (!user) {
