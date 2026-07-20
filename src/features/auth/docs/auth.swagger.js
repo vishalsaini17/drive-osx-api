@@ -85,6 +85,37 @@
 
 /**
  * @openapi
+ * /mail/auth:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Validate SMTP mail credentials for the mail microservice
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [username, password]
+ *             properties:
+ *               username:
+ *                 type: string
+ *                 example: john
+ *               password:
+ *                 type: string
+ *                 example: password123
+ *     responses:
+ *       200:
+ *         description: Mail credentials validated successfully
+ *       400:
+ *         description: Missing username or password
+ *       401:
+ *         description: Invalid credentials
+ *       404:
+ *         description: User not found
+ */
+
+/**
+ * @openapi
  * /workspaces:
  *   post:
  *     tags: [Workspaces]

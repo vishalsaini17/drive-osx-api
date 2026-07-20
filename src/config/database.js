@@ -10,5 +10,9 @@ export async function connectDatabase() {
     return;
   }
 
-  await mongoose.connect(env.MONGO_URI);
+  const connectionUri = env.MONGO_URI.includes('?')
+    ? `${env.MONGO_URI}&db=${env.MONGO_DB_NAME}`
+    : `${env.MONGO_URI}/${env.MONGO_DB_NAME}`;
+
+  await mongoose.connect(connectionUri);
 }

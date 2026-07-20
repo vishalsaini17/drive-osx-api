@@ -24,7 +24,6 @@ export const register = asyncHandler(async (req, res) => {
 export const login = asyncHandler(async (req, res) => {
   const dto = new LoginDto(req.body);
   validateLoginInput(dto);
-
   const result = await authService.login(dto);
   res.json({ message: 'Login successful', ...result });
 });
