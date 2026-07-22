@@ -10,9 +10,11 @@ const userSchema = new mongoose.Schema(
       trim: true,
       index: true
     },
+    firstName: { type: String, required: true, trim: true },
+    lastName: { type: String, required: true, trim: true },
     fullName: { type: String, required: true, trim: true },
     email: { type: String, required: false, lowercase: true, trim: true },
-    recoveryEmail: { type: String, required: true, lowercase: true, trim: true },
+    recoveryEmail: { type: String, required: false, lowercase: true, trim: true },
     mobile: { type: String, required: false, trim: true },
     password: { type: String, required: true },
     currentWorkspaceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Workspace', default: null },

@@ -21,7 +21,7 @@
  *         application/json:
  *           schema:
  *             type: object
- *             required: [username, password, fullName, recoveryEmail]
+ *             required: [username, password, firstName, lastName]
  *             properties:
  *               username:
  *                 type: string
@@ -29,9 +29,12 @@
  *               password:
  *                 type: string
  *                 example: password123
- *               fullName:
+ *               firstName:
  *                 type: string
- *                 example: John Doe
+ *                 example: John
+ *               lastName:
+ *                 type: string
+ *                 example: Doe
  *               recoveryEmail:
  *                 type: string
  *                 example: john@gmail.com

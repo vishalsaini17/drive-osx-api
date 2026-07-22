@@ -13,16 +13,20 @@ import {
 const workspaceService = new WorkspaceService();
 
 export class AuthService {
-  async register({ username, password, fullName, recoveryEmail, mobile }) {
+  async register({ username, password, firstName, lastName, recoveryEmail, mobile }) {
     const existingUser = await findUserByUsername(username);
     if (existingUser) {
       throw new AppError(409, 'Username already exists');
     }
 
     const hashedPassword = await hashPassword(password);
+    const fullName = `${firstName.trim()} ${lastName.trim()}`;
     const user = await createUser({
       username,
+      firstName,
+      lastName,
       fullName,
+      email: recoveryEmail || undefined,
       recoveryEmail,
       mobile,
       password: hashedPassword
@@ -37,7 +41,10 @@ export class AuthService {
       user: {
         id: user._id,
         username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
         fullName: user.fullName,
+        email: user.email,
         recoveryEmail: user.recoveryEmail,
         mobile: user.mobile
       }
@@ -62,7 +69,10 @@ export class AuthService {
       user: {
         id: user._id,
         username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
         fullName: user.fullName,
+        email: user.email,
         recoveryEmail: user.recoveryEmail,
         mobile: user.mobile
       }
