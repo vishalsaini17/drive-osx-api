@@ -29,7 +29,8 @@ export const login = asyncHandler(async (req, res) => {
 });
 
 export const profile = asyncHandler(async (req, res) => {
-  res.json({ message: 'Profile accessed', user: req.user });
+  const user = await authService.getProfile(req.user.id);
+  res.json({ message: 'Profile accessed', user });
 });
 
 export const mailAuth = asyncHandler(async (req, res) => {

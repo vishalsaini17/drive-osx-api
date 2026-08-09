@@ -28,30 +28,30 @@ export function validateRegisterInput({ username, password, firstName, lastName,
 
 export function validateLoginInput({ username, password }) {
   if (!username || !password) {
-    throw new Error('Username and password are required');
+    throw new AppError(400, 'Username and password are required');
   }
 
   if (typeof username !== 'string' || typeof password !== 'string') {
-    throw new Error('Input fields must be strings');
+    throw new AppError(400, 'Input fields must be strings');
   }
 }
 
 export function validateForgotPasswordInput({ email }) {
   if (!email) {
-    throw new Error('Email is required');
+    throw new AppError(400, 'Email is required');
   }
 
   if (typeof email !== 'string') {
-    throw new Error('Email must be a string');
+    throw new AppError(400, 'Email must be a string');
   }
 }
 
 export function validateResetPasswordInput({ token, password }) {
   if (!token || !password) {
-    throw new Error('Token and password are required');
+    throw new AppError(400, 'Token and password are required');
   }
 
   if (typeof token !== 'string' || typeof password !== 'string') {
-    throw new Error('Token and password must be strings');
+    throw new AppError(400, 'Token and password must be strings');
   }
 }

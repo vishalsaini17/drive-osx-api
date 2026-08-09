@@ -2,15 +2,26 @@ import { AppError } from '../../../shared/common/AppError.js';
 import { comparePassword, hashPassword } from '../../../utils/password.js';
 import { signToken, generateResetToken, verifyResetToken } from '../../../utils/jwt.js';
 import { WorkspaceService } from '../../workspaces/services/workspace.service.js';
+import { FileService } from '../../files/services/file.service.js';
+import { File } from '../../files/models/file.model.js';
 import {
   createUser,
   findUserByEmail,
   findUserByUsername,
+  findUserById,
   updateUser,
   findUserByResetToken
 } from '../repositories/user.repository.js';
 
 const workspaceService = new WorkspaceService();
+const fileService = new FileService();
+
+const DEFAULT_FOLDERS = [
+  { name: 'Documents', parentId: null },
+  { name: 'Pictures', parentId: null },
+  { name: 'Videos', parentId: null },
+  { name: 'Music', parentId: null },
+];
 
 export class AuthService {
   async register({ username, password, firstName, lastName, recoveryEmail, mobile }) {
@@ -21,14 +32,15 @@ export class AuthService {
 
     const hashedPassword = await hashPassword(password);
     const fullName = `${firstName.trim()} ${lastName.trim()}`;
+    const userEmail = `${username.toLowerCase()}@diveosx.com`;
     const user = await createUser({
       username,
       firstName,
       lastName,
       fullName,
-      email: recoveryEmail || undefined,
-      recoveryEmail,
-      mobile,
+      email: userEmail,
+      recoveryEmail: recoveryEmail?.trim() || undefined,
+      mobile: mobile?.trim() || undefined,
       password: hashedPassword
     });
 
@@ -36,6 +48,20 @@ export class AuthService {
       name: `${fullName}'s Workspace`,
       type: 'personal'
     });
+
+    for (const folder of DEFAULT_FOLDERS) {
+      const existing = await File.findOne({ ownerId: user._id, name: folder.name, parentId: null, deletedAt: null });
+      if (!existing) {
+        await fileService.createFile({
+          ownerId: user._id,
+          name: folder.name,
+          type: 'folder',
+          parentId: folder.parentId,
+          mimeType: 'folder',
+          pinned: true
+        });
+      }
+    }
 
     return {
       user: {
@@ -97,6 +123,23 @@ export class AuthService {
       recoveryEmail: user.recoveryEmail,
       mobile: user.mobile,
       email: user.email || null
+    };
+  }
+
+  async getProfile(userId) {
+    const user = await findUserById(userId);
+    if (!user) {
+      throw new AppError(404, 'User not found');
+    }
+    return {
+      id: user._id,
+      username: user.username,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      fullName: user.fullName,
+      email: user.email,
+      recoveryEmail: user.recoveryEmail,
+      mobile: user.mobile
     };
   }
 

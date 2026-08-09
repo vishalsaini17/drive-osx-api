@@ -2,10 +2,14 @@ import express from 'express';
 import cors from 'cors';
 import authRoutes from './features/auth/routes/auth.routes.js';
 import workspaceRoutes from './features/workspaces/routes/workspace.routes.js';
+import mailRoutes from './features/mail/routes/mail.routes.js';
+import fileRoutes from './features/files/routes/file.routes.js';
+import meetingRoutes from './features/meetings/routes/meeting.routes.js';
 import { connectDatabase } from './config/database.js';
 import { env } from './config/env.js';
 import { setupSwagger } from './docs/swagger.js';
 import { AppError } from './shared/common/AppError.js';
+import { createSignalingServer } from './websocket/signaling.js';
 
 export async function createApp() {
   const app = express();
@@ -20,6 +24,9 @@ export async function createApp() {
 
   app.use(`/api/${env.API_VERSION}`, authRoutes);
   app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
+  app.use(`/api/${env.API_VERSION}/mail`, mailRoutes);
+  app.use(`/api/${env.API_VERSION}/files`, fileRoutes);
+  app.use(`/api/${env.API_VERSION}/meetings`, meetingRoutes);
   setupSwagger(app);
 
   app.use((error, _req, res, _next) => {
@@ -40,7 +47,11 @@ export async function startApp() {
   await connectDatabase();
 
   const app = await createApp();
-  app.listen(env.PORT, () => {
+  const server = app.listen(env.PORT, () => {
     console.log(`Server running on http://localhost:${env.PORT}`);
   });
+
+  createSignalingServer(server);
+
+  return server;
 }

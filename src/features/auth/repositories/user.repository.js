@@ -42,6 +42,10 @@ export async function updateUser(userId, payload) {
   return User.findByIdAndUpdate(userId, payload, { new: true });
 }
 
+export async function findUserById(userId) {
+  return User.findById(userId);
+}
+
 export async function findUserByResetToken(resetToken) {
   return User.findOne({
     resetToken,
