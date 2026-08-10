@@ -1,10 +1,10 @@
-import { Server } from 'ws';
+import { WebSocketServer } from 'ws';
 import jwt from 'jsonwebtoken';
 
 const meetings = new Map();
 
 export function createSignalingServer(server) {
-  const wss = new Server({ server, path: '/ws/meetings' });
+  const wss = new WebSocketServer({ server, path: '/ws/meetings' });
 
   wss.on('connection', (ws, req) => {
     const token = new URL(req.url, 'http://localhost').searchParams.get('token');

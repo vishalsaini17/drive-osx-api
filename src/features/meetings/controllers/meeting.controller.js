@@ -1,6 +1,6 @@
-import { asyncHandler } from '../../../shared/common/AsyncHandler.js';
 import { MeetingService } from '../services/meeting.service.js';
 import { authenticate } from '../../../middleware/auth.middleware.js';
+import { asyncHandler } from '../../../shared/common/asyncHandler.js';
 
 const meetingService = new MeetingService();
 

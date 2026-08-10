@@ -1,5 +1,6 @@
 import { AppError } from '../../../shared/common/AppError.js';
 import { User } from '../../auth/repositories/user.repository.js';
+import { Meeting } from '../models/meeting.model.js';
 import {
   createMeeting,
   findMeetingById,
