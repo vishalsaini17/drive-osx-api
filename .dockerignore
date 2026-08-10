@@ -1,4 +1,12 @@
 node_modules
 .git
 .env
+.env.*
 npm-debug.log*
+coverage
+.cache
+dist
+build
+.DS_Store
+Thumbs.db
+*.log
