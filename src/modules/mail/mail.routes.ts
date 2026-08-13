@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { authenticate, requireOrganization, requireUser } from '../../platform/authentication/authenticate.js';
+import { requireMailGateway } from '../../platform/authentication/mail-gateway.js';
 import { asyncHandler } from '../../platform/http/async-handler.js';
 import { parseBody, parseParams, parseQuery } from '../../platform/http/validate.js';
 import { rateLimit } from '../../platform/http/rate-limit.js';
@@ -48,12 +49,15 @@ const emailParams = z.object({ emailId: z.string().uuid('Invalid message id') })
 
 /**
  * Delivery endpoint for the SMTP gateway. It runs before `authenticate()`
- * because inbound mail carries no user session; it is reachable only from the
- * internal network and is rate limited.
+ * because inbound mail carries no user session, so it proves its origin with
+ * the shared gateway secret instead. Network placement is not a control here:
+ * the API is published on a host port, so an unauthenticated endpoint would
+ * let anyone deliver mail with a forged sender.
  */
 mailRoutes.post(
   '/receive',
   rateLimit({ bucket: 'mail-receive', windowSeconds: 60, max: 600 }),
+  requireMailGateway(),
   asyncHandler(async (req: Request, res: Response) => {
     const body = parseBody(receiveSchema, req);
     const email = await service.receiveEmail(body);

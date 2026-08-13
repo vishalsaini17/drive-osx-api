@@ -1,4 +1,4 @@
-import { withTransaction } from '../infrastructure/database/pool.js';
+import { queryMany, queryOne, withTransaction } from '../infrastructure/database/pool.js';
 import { logger } from '../infrastructure/observability/logger.js';
 import { enqueue, registerJobHandler } from '../infrastructure/queue/queue.js';
 import { objectKeys } from '../infrastructure/storage/object-storage.js';
@@ -96,6 +96,96 @@ function registerDomainEventHandlers(): void {
         data: { organizationId: event.payload.organizationId, role: event.payload.role },
       }),
     );
+  });
+
+  // --- messaging ----------------------------------------------------------
+  //
+  // A chat request that produces no notification is only discoverable by
+  // opening Messenger and looking for it, which is how the request flow
+  // stalls. Each handler notifies the counterpart, never the actor.
+
+  onEvent('chat.request_sent', async (event) => {
+    const requester = await findUserById(event.payload.requesterId);
+
+    await withTransaction((tx) =>
+      createNotification(tx, {
+        organizationId: event.payload.organizationId,
+        userId: event.payload.recipientId,
+        type: 'chat.request_received',
+        title: `${requester?.full_name ?? 'Someone'} wants to chat`,
+        body: 'Accept the request to start a conversation.',
+        data: { requestId: event.payload.requestId, requesterId: event.payload.requesterId },
+      }),
+    );
+  });
+
+  onEvent('chat.request_accepted', async (event) => {
+    const recipient = await findUserById(event.payload.recipientId);
+
+    // The person who accepted already knows; tell the one who asked.
+    await withTransaction((tx) =>
+      createNotification(tx, {
+        organizationId: event.payload.organizationId,
+        userId: event.payload.requesterId,
+        type: 'chat.request_accepted',
+        title: `${recipient?.full_name ?? 'Your request'} accepted your chat request`,
+        body: 'You can now send messages.',
+        data: {
+          conversationId: event.payload.conversationId,
+          recipientId: event.payload.recipientId,
+        },
+      }),
+    );
+  });
+
+  onEvent('chat.message_sent', async (event) => {
+    const sender = await findUserById(event.payload.senderId);
+
+    // The message text, so the notification can show a preview rather than
+    // "you have a message" — a system notification the recipient cannot read
+    // without opening the app is barely worth raising.
+    const message = await queryOne<{ body: string }>(
+      `SELECT body FROM messages WHERE id = $1 AND deleted_at IS NULL`,
+      [event.payload.messageId],
+    );
+
+    // A deleted message should not resurface as a notification.
+    if (!message) return;
+
+    const preview = message.body.length > 140 ? `${message.body.slice(0, 139)}…` : message.body;
+
+    // Every participant except the sender. Group conversations fan out here
+    // too, so this does not need revisiting when they arrive.
+    const recipients = await queryMany<{ user_id: string }>(
+      `SELECT cp.user_id
+         FROM conversation_participants cp
+        WHERE cp.conversation_id = $1
+          AND cp.user_id <> $2
+          AND cp.is_muted = false`,
+      [event.payload.conversationId, event.payload.senderId],
+    );
+
+    for (const recipient of recipients) {
+      await withTransaction((tx) =>
+        createNotification(tx, {
+          organizationId: event.payload.organizationId,
+          userId: recipient.user_id,
+          type: 'chat.message',
+          title: sender?.full_name ?? 'New message',
+          body: preview,
+          data: {
+            conversationId: event.payload.conversationId,
+            // Carried so a client can recognise a message it has already shown
+            // and not raise the same notification twice.
+            messageId: event.payload.messageId,
+            senderId: event.payload.senderId,
+            senderName: sender?.full_name ?? 'Someone',
+            // Tells the shell which application to open on a click.
+            appId: 'messenger',
+          },
+        }),
+      );
+    }
   });
 }
 

@@ -18,6 +18,8 @@ import { meetingRoutes } from './modules/meetings/meetings.routes.js';
 import { notificationRoutes } from './modules/notifications/notifications.routes.js';
 import { searchRoutes } from './modules/search/search.routes.js';
 import { auditRoutes } from './modules/audit/audit.routes.js';
+import { messagingRoutes } from './modules/messaging/messaging.routes.js';
+import { contactRoutes } from './modules/contacts/contacts.routes.js';
 
 export function createApp(): Express {
   const app = express();
@@ -71,6 +73,8 @@ export function createApp(): Express {
   app.use(`${apiBasePath}/notifications`, notificationRoutes);
   app.use(`${apiBasePath}/search`, searchRoutes);
   app.use(`${apiBasePath}/audit-logs`, auditRoutes);
+  app.use(`${apiBasePath}/messaging`, messagingRoutes);
+  app.use(`${apiBasePath}/contacts`, contactRoutes);
 
   if (!isProduction) {
     mountApiDocs(app);

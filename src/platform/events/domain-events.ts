@@ -30,6 +30,20 @@ export interface DomainEventMap {
   'mail.sent': { organizationId: string; emailId: string; userId: string; to: string };
   'meeting.created': { organizationId: string; meetingId: string; hostId: string };
   'meeting.ended': { organizationId: string; meetingId: string };
+  'chat.request_sent': { organizationId: string; requestId: string; requesterId: string; recipientId: string };
+  'chat.request_accepted': {
+    organizationId: string;
+    requestId: string;
+    conversationId: string;
+    requesterId: string;
+    recipientId: string;
+  };
+  'chat.message_sent': {
+    organizationId: string;
+    conversationId: string;
+    messageId: string;
+    senderId: string;
+  };
 }
 
 export type DomainEventName = keyof DomainEventMap;

@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { authenticate, requireOrganization } from '../../platform/authentication/authenticate.js';
 import { asyncHandler } from '../../platform/http/async-handler.js';
-import { parseBody, parseParams } from '../../platform/http/validate.js';
+import { parseBody, parseParams, parseQuery } from '../../platform/http/validate.js';
 import * as service from './meetings.service.js';
 
 export const meetingRoutes = Router();
@@ -35,6 +35,21 @@ meetingRoutes.post(
     const body = parseBody(createSchema, req);
     const meeting = await service.createMeeting(actorOf(req), body);
     res.status(201).json({ message: 'Meeting created', meeting });
+  }),
+);
+
+meetingRoutes.get(
+  '/',
+  asyncHandler(async (req: Request, res: Response) => {
+    const options = parseQuery(
+      z.object({
+        status: z.enum(['scheduled', 'active', 'ended', 'cancelled']).optional(),
+        limit: z.coerce.number().int().min(1).max(200).optional(),
+        offset: z.coerce.number().int().min(0).optional(),
+      }),
+      req,
+    );
+    res.json({ meetings: await service.listMeetings(actorOf(req), options) });
   }),
 );
 

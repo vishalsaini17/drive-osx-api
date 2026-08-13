@@ -233,6 +233,37 @@ export async function getMeeting(actor: Actor, meetingId: string): Promise<Meeti
   return toMeetingView(meeting, await loadParticipants(meetingId), await loadMessages(meetingId));
 }
 
+/**
+ * Meetings the caller hosts or takes part in, newest first.
+ *
+ * Paginated rather than unbounded: a long-lived account accumulates meetings
+ * indefinitely, and the collection endpoint should not grow without limit
+ * (CLAUDE.md §42).
+ */
+export async function listMeetings(
+  actor: Actor,
+  options: { status?: 'scheduled' | 'active' | 'ended' | 'cancelled'; limit?: number; offset?: number } = {},
+): Promise<MeetingView[]> {
+  const limit = Math.min(options.limit ?? 50, 200);
+  const offset = Math.max(options.offset ?? 0, 0);
+
+  const rows = await queryMany<MeetingRow>(
+    `SELECT DISTINCT ${MEETING_COLUMNS.split(',')
+      .map((column) => `m.${column.trim()}`)
+      .join(', ')}
+       FROM meetings m
+       LEFT JOIN meeting_participants p ON p.meeting_id = m.id
+      WHERE m.organization_id = $1
+        AND (m.host_id = $2 OR p.user_id = $2)
+        AND ($3::text IS NULL OR m.status = $3)
+      ORDER BY m.start_time DESC
+      LIMIT $4 OFFSET $5`,
+    [actor.organizationId, actor.userId, options.status ?? null, limit, offset],
+  );
+
+  return Promise.all(rows.map(async (row) => toMeetingView(row, await loadParticipants(row.id))));
+}
+
 export async function listTodayMeetings(actor: Actor): Promise<MeetingView[]> {
   const rows = await queryMany<MeetingRow>(
     `SELECT DISTINCT ${MEETING_COLUMNS.split(',')

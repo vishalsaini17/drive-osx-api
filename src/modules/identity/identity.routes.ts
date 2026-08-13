@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate } from '../../platform/authentication/authenticate.js';
+import { requireMailGateway } from '../../platform/authentication/mail-gateway.js';
 import { rateLimit } from '../../platform/http/rate-limit.js';
 import * as controller from './identity.controller.js';
 
@@ -24,5 +25,7 @@ identityRoutes.patch('/profile', authenticate(), controller.updateProfile);
 identityRoutes.post('/forgot-password', credentialLimit, controller.forgotPassword);
 identityRoutes.post('/reset-password', credentialLimit, controller.resetPassword);
 
-// Called by the SMTP gateway to validate mailbox credentials.
-identityRoutes.post('/mail/auth', credentialLimit, controller.mailAuth);
+// Called by the SMTP gateway to validate mailbox credentials. It is a
+// credential oracle, so it is restricted to the gateway rather than left open
+// on the public API alongside /login.
+identityRoutes.post('/mail/auth', credentialLimit, requireMailGateway(), controller.mailAuth);

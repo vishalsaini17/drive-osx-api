@@ -54,6 +54,15 @@ const schema = z.object({
 
   // Platform behaviour.
   MAIL_DOMAIN: z.string().default('driveosx.com'),
+  /**
+   * Shared secret proving a request to the inbound-mail endpoint came from the
+   * SMTP gateway. That endpoint cannot carry a user session — inbound mail has
+   * no logged-in actor — so without this secret anyone who can reach the API
+   * can deliver a message into any mailbox with a forged sender.
+   *
+   * Required in production; `load()` refuses to boot without it.
+   */
+  MAIL_GATEWAY_TOKEN: z.string().optional(),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(100 * 1024 * 1024),
   INLINE_CONTENT_MAX_BYTES: z.coerce.number().int().positive().default(1024 * 1024),
   DEFAULT_STORAGE_QUOTA_BYTES: z.coerce
@@ -81,7 +90,21 @@ function load(): Env {
     throw new Error(`Invalid environment configuration:\n${issues}`);
   }
 
-  return parsed.data;
+  const value = parsed.data;
+
+  // A missing gateway secret leaves inbound mail open to anyone who can reach
+  // the API. That is a deployment mistake, not a runtime condition, so it is
+  // caught at boot rather than on the first delivery.
+  if (value.NODE_ENV === 'production' && !value.MAIL_GATEWAY_TOKEN) {
+    throw new Error(
+      'Invalid environment configuration:\n' +
+        '  - MAIL_GATEWAY_TOKEN: required in production. Without it, POST /mail/receive\n' +
+        '    accepts unauthenticated deliveries with an attacker-chosen sender.\n' +
+        '    Generate one with: openssl rand -hex 32',
+    );
+  }
+
+  return value;
 }
 
 export const env: Env = load();
