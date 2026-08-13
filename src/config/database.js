@@ -7,12 +7,18 @@ export async function connectDatabase() {
   }
 
   if (mongoose.connection.readyState === 1) {
+    console.log('MongoDB is already connected.');
     return;
   }
 
-  const connectionUri = env.MONGO_URI.includes('?')
-    ? `${env.MONGO_URI}&db=${env.MONGO_DB_NAME}`
-    : `${env.MONGO_URI}/${env.MONGO_DB_NAME}`;
+  try {
+    await mongoose.connect(env.MONGO_URI);
 
-  await mongoose.connect(connectionUri);
+    console.log(
+      `MongoDB connected successfully: ${mongoose.connection.host}/${mongoose.connection.name}`
+    );
+  } catch (error) {
+    console.error('MongoDB connection failed:', error);
+    process.exit(1);
+  }
 }

@@ -1,10 +1,13 @@
 import express from 'express';
 import cors from 'cors';
+
 import authRoutes from './features/auth/routes/auth.routes.js';
 import workspaceRoutes from './features/workspaces/routes/workspace.routes.js';
 import mailRoutes from './features/mail/routes/mail.routes.js';
 import fileRoutes from './features/files/routes/file.routes.js';
 import meetingRoutes from './features/meetings/routes/meeting.routes.js';
+import userRoutes from './features/user/routes/user.route.js'
+
 import { connectDatabase } from './config/database.js';
 import { env } from './config/env.js';
 import { setupSwagger } from './docs/swagger.js';
@@ -27,6 +30,7 @@ export async function createApp() {
   app.use(`/api/${env.API_VERSION}/mail`, mailRoutes);
   app.use(`/api/${env.API_VERSION}/files`, fileRoutes);
   app.use(`/api/${env.API_VERSION}/meetings`, meetingRoutes);
+  app.use(`/api/${env.API_VERSION}`, userRoutes);
   setupSwagger(app);
 
   app.use((error, _req, res, _next) => {
