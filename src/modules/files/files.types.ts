@@ -153,6 +153,12 @@ export function isTextLike(mimeType: string): boolean {
     mimeType === 'application/javascript' ||
     mimeType === 'application/typescript' ||
     mimeType === 'application/xml' ||
-    mimeType === 'image/svg+xml'
+    mimeType === 'image/svg+xml' ||
+    // RFC 6839 structured syntax suffixes: any vendor/app type built on JSON
+    // or XML (e.g. `application/vnd.driveosx.book+json`) is text underneath,
+    // so a new structured document format never has to earn its way onto
+    // this list one mimetype at a time.
+    mimeType.endsWith('+json') ||
+    mimeType.endsWith('+xml')
   );
 }
