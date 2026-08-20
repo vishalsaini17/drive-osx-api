@@ -153,7 +153,13 @@ function checksumOf(buffer: Buffer): string {
 
 async function readInlineContent(file: FileRow): Promise<string | undefined> {
   if (file.type === 'folder' || !file.storage_key) return '';
-  if (!isTextLike(file.mime_type)) return undefined;
+  // A file created/uploaded before its extension was recognized (or before it
+  // was added to EXTENSION_MIME_TYPES) can be stuck at the generic fallback
+  // mimeType in the database even though updateFile() self-heals it on the
+  // next save. Re-check against the filename here too, so content isn't
+  // withheld on read just because no save has happened since.
+  const effectiveMimeType = isTextLike(file.mime_type) ? file.mime_type : inferMimeType(file.name, file.type);
+  if (!isTextLike(effectiveMimeType)) return undefined;
   if (Number(file.size) > env.INLINE_CONTENT_MAX_BYTES) return undefined;
 
   try {
@@ -370,6 +376,16 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
 
     const currentKey = file.storage_key ?? objectKeys.original(actor.organizationId, fileId);
 
+    // Content-editing clients (e.g. the code editor) don't always resend a
+    // mimeType on every save. If the file is stuck at the generic fallback —
+    // typically from an earlier upload/creation whose extension wasn't
+    // recognized — re-infer it from the filename here so a save always
+    // self-heals a wrongly tagged file, rather than requiring content to stay
+    // permanently withheld on read (readInlineContent()/isTextLike() below).
+    const effectiveMimeType =
+      input.mimeType ?? (file.mime_type === 'application/octet-stream' ? inferMimeType(file.name, 'file') : file.mime_type);
+    if (effectiveMimeType !== file.mime_type) patch.mimeType = effectiveMimeType;
+
     // Preserve the outgoing bytes before they are overwritten. A failure here
     // aborts the edit: losing the previous version silently is worse than
     // asking the user to retry.
@@ -381,7 +397,7 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
     await objectStorage.put({
       key: currentKey,
       body,
-      contentType: input.mimeType ?? file.mime_type,
+      contentType: effectiveMimeType,
       contentLength: newSize,
     });
 
@@ -389,9 +405,7 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
     patch.size = newSize;
     patch.checksum = checksumOf(body);
     patch.versionNo = file.version_no + 1;
-    patch.contentText = isTextLike(input.mimeType ?? file.mime_type)
-      ? body.toString('utf8').slice(0, 100_000)
-      : null;
+    patch.contentText = isTextLike(effectiveMimeType) ? body.toString('utf8').slice(0, 100_000) : null;
   }
 
   const updated = await withTransaction(async (tx) => {
@@ -410,7 +424,7 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
         storageKey: patch.storageKey ?? objectKeys.original(actor.organizationId, fileId),
         size: newSize,
         checksum: patch.checksum ?? null,
-        mimeType: input.mimeType ?? file.mime_type,
+        mimeType: patch.mimeType ?? file.mime_type,
         comment: 'Edited',
         createdBy: actor.userId,
       });
