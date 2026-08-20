@@ -2,6 +2,7 @@ import { AppError } from '../../platform/errors/app-error.js';
 import { publishEvent } from '../../platform/events/event-bus.js';
 import { requireMembership } from '../../platform/authorization/access-control.js';
 import { query, queryMany, queryOne, withTransaction } from '../../infrastructure/database/pool.js';
+import { effectivePresence } from '../contacts/contacts.service.js';
 
 /**
  * Direct messaging.
@@ -97,7 +98,11 @@ function mapUser(row: Record<string, any>): UserSummary {
     fullName: row.full_name,
     email: row.email,
     avatarUrl: row.avatar_url ?? null,
-    status: row.status,
+    // The stored row can't be trusted on its own — a browser that closes,
+    // crashes, or loses its network never gets to write 'offline', so this
+    // decays a stale heartbeat the same way contacts.service's presenceFor
+    // does (see effectivePresence's doc comment).
+    status: effectivePresence({ status: row.status, lastSeenAt: row.last_seen_at }),
     statusText: row.status_text ?? '',
     statusEmoji: row.status_emoji ?? '',
     lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
