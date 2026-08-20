@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { authenticate, requireOrganization } from '../../platform/authentication/authenticate.js';
 import { asyncHandler } from '../../platform/http/async-handler.js';
-import { parseBody, parseParams } from '../../platform/http/validate.js';
+import { parseBody, parseParams, parseQuery } from '../../platform/http/validate.js';
 import { RESOURCE_ROLES } from '../../platform/authorization/roles.js';
 import * as service from './sharing.service.js';
 
@@ -11,12 +11,18 @@ export const sharingRoutes = Router();
 const fileParams = z.object({ fileId: z.string().uuid('Invalid file id') });
 const shareParams = z.object({ shareId: z.string().uuid('Invalid share id') });
 
-const shareUserSchema = z.object({
-  usernameOrEmail: z.string().trim().min(1, 'Enter a username or email address'),
-  role: z.enum(RESOURCE_ROLES).default('viewer'),
-  message: z.string().max(500).optional(),
-  expiresAt: z.string().datetime().optional(),
-});
+const shareUserSchema = z
+  .object({
+    userId: z.string().uuid().optional(),
+    usernameOrEmail: z.string().trim().min(1).optional(),
+    role: z.enum(RESOURCE_ROLES).default('viewer'),
+    message: z.string().max(500).optional(),
+    expiresAt: z.string().datetime().optional(),
+  })
+  .refine((data) => data.userId ?? data.usernameOrEmail, {
+    message: 'Provide a userId or a username/email',
+    path: ['usernameOrEmail'],
+  });
 
 const shareTeamSchema = z.object({
   teamId: z.string().uuid('Invalid team id'),
@@ -59,6 +65,25 @@ sharingRoutes.get(
     const { fileId } = parseParams(fileParams, req);
     const shares = await service.listSharesForFile(actorOf(req), fileId);
     res.json({ shares });
+  }),
+);
+
+sharingRoutes.get(
+  '/files/:fileId/eligible-users',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { fileId } = parseParams(fileParams, req);
+    const { q } = parseQuery(z.object({ q: z.string().trim().max(120).default('') }), req);
+    const users = await service.searchEligibleUsers(actorOf(req), fileId, q);
+    res.json({ users });
+  }),
+);
+
+sharingRoutes.get(
+  '/files/:fileId/activity',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { fileId } = parseParams(fileParams, req);
+    const activity = await service.listFileActivity(actorOf(req), fileId);
+    res.json({ activity });
   }),
 );
 

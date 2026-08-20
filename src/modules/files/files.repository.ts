@@ -6,6 +6,14 @@ const FILE_COLUMNS = `
   checksum, starred, pinned, version_no, metadata, deleted_at, created_at, updated_at
 `;
 
+/**
+ * Active-share count as a correlated subquery, appended only to the two
+ * queries that feed user-facing listings (the shared-item badge). Not folded
+ * into FILE_COLUMNS itself: that constant is also re-split/re-aliased by the
+ * recursive ancestor/breadcrumb queries below, which would mangle a subquery.
+ */
+const SHARED_COUNT_COLUMN = `(SELECT count(*)::int FROM shares s WHERE s.file_id = files.id AND s.revoked_at IS NULL) AS shared_count`;
+
 export interface InsertFileInput {
   /** Supplied by the caller so bytes can be written to storage before the row exists. */
   id: string;
@@ -51,28 +59,44 @@ export async function insertFile(tx: Queryable, input: InsertFileInput): Promise
 }
 
 export function findFileById(organizationId: string, fileId: string): Promise<FileRow | null> {
-  return queryOne<FileRow>(`SELECT ${FILE_COLUMNS} FROM files WHERE id = $1 AND organization_id = $2`, [
-    fileId,
-    organizationId,
-  ]);
+  return queryOne<FileRow>(
+    `SELECT ${FILE_COLUMNS}, ${SHARED_COUNT_COLUMN} FROM files WHERE id = $1 AND organization_id = $2`,
+    [fileId, organizationId],
+  );
 }
 
-/** Used only by link-share resolution, where the tenant is derived from the file. */
+/**
+ * Not scoped by organization — used for link-share resolution and for the
+ * general file loader in `files.service.ts`, both of which may legitimately
+ * be looking at a file that belongs to a different org than the caller
+ * (direct/team shares cross that boundary; authorization is decided
+ * separately by `requireFileAccess`, not by this lookup).
+ */
 export function findFileByIdUnscoped(fileId: string): Promise<FileRow | null> {
-  return queryOne<FileRow>(`SELECT ${FILE_COLUMNS} FROM files WHERE id = $1`, [fileId]);
+  return queryOne<FileRow>(`SELECT ${FILE_COLUMNS}, ${SHARED_COUNT_COLUMN} FROM files WHERE id = $1`, [fileId]);
 }
 
+/**
+ * `organizationId`/`ownerId` are only meaningful when `parentId` is null: a
+ * bare root listing (`parent_id IS NULL`) would otherwise match every user's
+ * root files across every organization, so it must be scoped to one owner in
+ * one org. A real folder id already uniquely scopes its own children — and
+ * once a folder is shared, an editor from a *different* org can create files
+ * inside it that they, not the folder's owner, own — so an owner/org filter
+ * there would hide legitimately visible content. Pass `null` for both
+ * whenever `parentId` is set.
+ */
 export function findFileByNameInFolder(input: {
-  organizationId: string;
-  ownerId: string;
+  organizationId: string | null;
+  ownerId: string | null;
   parentId: string | null;
   name: string;
 }): Promise<FileRow | null> {
   return queryOne<FileRow>(
     `SELECT ${FILE_COLUMNS}
        FROM files
-      WHERE organization_id = $1
-        AND owner_id = $2
+      WHERE ($1::uuid IS NULL OR organization_id = $1)
+        AND ($2::uuid IS NULL OR owner_id = $2)
         AND parent_id IS NOT DISTINCT FROM $3
         AND lower(name) = lower($4)
         AND deleted_at IS NULL`,
@@ -81,8 +105,9 @@ export function findFileByNameInFolder(input: {
 }
 
 export interface ListChildrenInput {
-  organizationId: string;
-  ownerId: string;
+  /** See the note above `findFileByNameInFolder` — null unless `parentId` is null. */
+  organizationId: string | null;
+  ownerId: string | null;
   parentId: string | null;
   includeDeleted?: boolean;
   limit: number;
@@ -91,10 +116,10 @@ export interface ListChildrenInput {
 
 export function listChildren(input: ListChildrenInput): Promise<FileRow[]> {
   return queryMany<FileRow>(
-    `SELECT ${FILE_COLUMNS}
+    `SELECT ${FILE_COLUMNS}, ${SHARED_COUNT_COLUMN}
        FROM files
-      WHERE organization_id = $1
-        AND owner_id = $2
+      WHERE ($1::uuid IS NULL OR organization_id = $1)
+        AND ($2::uuid IS NULL OR owner_id = $2)
         AND parent_id IS NOT DISTINCT FROM $3
         AND ($4::boolean OR deleted_at IS NULL)
       ORDER BY type = 'folder' DESC, name
@@ -104,14 +129,17 @@ export function listChildren(input: ListChildrenInput): Promise<FileRow[]> {
 }
 
 export async function countChildren(
-  organizationId: string,
+  organizationId: string | null,
   parentId: string | null,
-  ownerId: string,
+  ownerId: string | null,
 ): Promise<number> {
   const row = await queryOne<{ count: string }>(
     `SELECT count(*) AS count
        FROM files
-      WHERE organization_id = $1 AND owner_id = $2 AND parent_id IS NOT DISTINCT FROM $3 AND deleted_at IS NULL`,
+      WHERE ($1::uuid IS NULL OR organization_id = $1)
+        AND ($2::uuid IS NULL OR owner_id = $2)
+        AND parent_id IS NOT DISTINCT FROM $3
+        AND deleted_at IS NULL`,
     [organizationId, ownerId, parentId],
   );
   return Number(row?.count ?? 0);
@@ -285,43 +313,49 @@ export function searchFiles(input: {
   );
 }
 
+/**
+ * Not organization-scoped: once a shared folder can contain files created by
+ * an editor from a different org (their own files, just parented under
+ * someone else's folder), a single folder's subtree can legitimately span
+ * more than one organization_id. The caller has already authorized the root
+ * of the walk; this just follows parent_id/id links from there.
+ */
+
 /** All descendants of a folder, deepest first — safe ordering for deletion. */
-export function listDescendants(organizationId: string, folderId: string): Promise<FileRow[]> {
+export function listDescendants(folderId: string): Promise<FileRow[]> {
   return queryMany<FileRow>(
     `WITH RECURSIVE tree AS (
        SELECT ${FILE_COLUMNS}, 0 AS depth
          FROM files
-        WHERE id = $2 AND organization_id = $1
+        WHERE id = $1
        UNION ALL
        SELECT ${FILE_COLUMNS.split(',')
          .map((column) => `f.${column.trim()}`)
          .join(', ')}, t.depth + 1
          FROM files f
          JOIN tree t ON f.parent_id = t.id
-        WHERE f.organization_id = $1
      )
      SELECT ${FILE_COLUMNS} FROM tree WHERE depth > 0 ORDER BY depth DESC`,
-    [organizationId, folderId],
+    [folderId],
   );
 }
 
 /** Ancestor chain from root to the file, for breadcrumbs and cycle checks. */
-export function listAncestors(organizationId: string, fileId: string): Promise<FileRow[]> {
+export function listAncestors(fileId: string): Promise<FileRow[]> {
   return queryMany<FileRow>(
     `WITH RECURSIVE chain AS (
        SELECT ${FILE_COLUMNS}, 0 AS depth
          FROM files
-        WHERE id = $2 AND organization_id = $1
+        WHERE id = $1
        UNION ALL
        SELECT ${FILE_COLUMNS.split(',')
          .map((column) => `f.${column.trim()}`)
          .join(', ')}, c.depth + 1
          FROM files f
          JOIN chain c ON c.parent_id = f.id
-        WHERE f.organization_id = $1
      )
      SELECT ${FILE_COLUMNS} FROM chain WHERE depth > 0 ORDER BY depth DESC`,
-    [organizationId, fileId],
+    [fileId],
   );
 }
 

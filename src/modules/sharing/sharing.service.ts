@@ -9,8 +9,9 @@ import { recordAudit } from '../audit/audit.service.js';
 import { findFileById, findFileByIdUnscoped } from '../files/files.repository.js';
 import { toFileView, type FileView } from '../files/files.types.js';
 import { findOrganizationById } from '../organizations/organizations.repository.js';
-import { findUserByAnyIdentifier } from '../identity/identity.repository.js';
-import { toOrganizationView } from '../organizations/organizations.types.js';
+import { findUserByAnyIdentifier, findUserById } from '../identity/identity.repository.js';
+import { toOrganizationView, type OrganizationSettings } from '../organizations/organizations.types.js';
+import { listAuditLogs } from '../audit/audit.service.js';
 
 export interface ShareView {
   id: string;
@@ -38,7 +39,7 @@ interface ShareRow {
   shared_by: string;
 }
 
-function toShareView(row: ShareRow): ShareView {
+export function toShareView(row: ShareRow): ShareView {
   return {
     id: row.id,
     fileId: row.file_id,
@@ -68,6 +69,24 @@ export interface Actor {
 }
 
 /**
+ * Pure policy decision, split out from `assertSharingAllowed` so it can be
+ * unit tested without a database. Only link shares can leave the tenant
+ * (CLAUDE.md §17); direct user/team shares stay within the app's existing
+ * contacts-based eligibility check instead.
+ */
+export function isSharingAllowed(
+  settings: Pick<OrganizationSettings, 'allowExternalSharing' | 'sharingPolicy'>,
+  principalType: ShareView['principalType'],
+): { allowed: boolean; message?: string } {
+  if (principalType !== 'link') return { allowed: true };
+  if (settings.allowExternalSharing) return { allowed: true };
+  if (settings.sharingPolicy.mode === 'restrict') {
+    return { allowed: false, message: settings.sharingPolicy.warningMessage };
+  }
+  return { allowed: true };
+}
+
+/**
  * The workspace sharing policy decides whether a share may leave the tenant
  * (CLAUDE.md §17). Policy lives with the organization; enforcement lives here.
  */
@@ -81,16 +100,17 @@ async function assertSharingAllowed(
   if (!organization) throw AppError.notFound('Workspace not found');
 
   const settings = toOrganizationView(organization).settings;
-  if (settings.allowExternalSharing) return;
-
-  if (settings.sharingPolicy.mode === 'restrict') {
-    throw AppError.permission(settings.sharingPolicy.warningMessage);
+  const decision = isSharingAllowed(settings, principalType);
+  if (!decision.allowed) {
+    throw AppError.permission(decision.message ?? 'Sharing is restricted in this workspace');
   }
 }
 
 export interface ShareWithUserInput {
   fileId: string;
-  usernameOrEmail: string;
+  /** Preferred when the caller already resolved a specific person (e.g. an eligible-users suggestion). */
+  userId?: string;
+  usernameOrEmail?: string;
   role: ResourceRole;
   message?: string;
   expiresAt?: string;
@@ -103,9 +123,13 @@ export async function shareWithUser(actor: Actor, input: ShareWithUserInput): Pr
   // Only someone who owns the file may hand out access to it.
   await requireFileAccess(actor.userId, subjectOf(file), 'owner');
 
-  const target = await findUserByAnyIdentifier(input.usernameOrEmail);
+  const target = input.userId
+    ? await findUserById(input.userId)
+    : input.usernameOrEmail
+      ? await findUserByAnyIdentifier(input.usernameOrEmail)
+      : null;
   if (!target) {
-    throw AppError.notFound(`No user found for "${input.usernameOrEmail}"`);
+    throw AppError.notFound(`No user found for "${input.userId ?? input.usernameOrEmail ?? ''}"`);
   }
   if (target.id === file.owner_id) {
     throw AppError.validation('This person already owns the file');
@@ -287,7 +311,7 @@ export async function resolveShareLink(token: string): Promise<{ file: FileView;
 }
 
 export async function listSharesForFile(actor: Actor, fileId: string): Promise<ShareView[]> {
-  const file = await findFileById(actor.organizationId, fileId);
+  const file = await findFileByIdUnscoped(fileId);
   if (!file) throw AppError.notFound('File not found');
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
@@ -349,4 +373,100 @@ export async function revokeShare(actor: Actor, shareId: string): Promise<void> 
 
 function subjectOf(file: { id: string; organization_id: string; owner_id: string }) {
   return { fileId: file.id, organizationId: file.organization_id, ownerId: file.owner_id };
+}
+
+export interface EligibleUser {
+  id: string;
+  name: string;
+  email: string;
+  username: string;
+  avatarUrl: string | null;
+}
+
+/**
+ * Candidates for "Share with...". Restricted to the caller's own contacts —
+ * the app's existing notion of a connection (`modules/contacts`) — rather
+ * than the full `users` table, so this cannot be used to discover arbitrary
+ * accounts on the platform. Only owners can add people, so eligibility is
+ * gated the same way `shareWithUser` is.
+ */
+export async function searchEligibleUsers(actor: Actor, fileId: string, term: string): Promise<EligibleUser[]> {
+  const file = await findFileById(actor.organizationId, fileId);
+  if (!file) throw AppError.notFound('File not found');
+  await requireFileAccess(actor.userId, subjectOf(file), 'owner');
+
+  const search = term.trim();
+  if (search.length < 2) return [];
+
+  const rows = await queryMany<{
+    id: string;
+    name: string;
+    email: string;
+    username: string;
+    avatar_url: string | null;
+  }>(
+    `SELECT u.id, u.full_name AS name, u.email, u.username, u.avatar_url
+       FROM contacts c
+       JOIN users u ON u.id = c.contact_user_id
+      WHERE c.owner_id = $1
+        AND c.contact_user_id IS NOT NULL
+        AND c.contact_user_id <> $1
+        AND u.status <> 'deleted'
+        AND (u.full_name ILIKE $2 OR u.email ILIKE $2 OR u.username ILIKE $2)
+        AND NOT EXISTS (
+          SELECT 1 FROM shares s
+           WHERE s.file_id = $3
+             AND s.revoked_at IS NULL
+             AND s.principal_type = 'user'
+             AND s.principal_id = u.id
+        )
+      ORDER BY u.full_name
+      LIMIT 10`,
+    [actor.userId, `%${search}%`, fileId],
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    username: row.username,
+    avatarUrl: row.avatar_url,
+  }));
+}
+
+export interface FileActivityEntry {
+  id: string;
+  action: string;
+  actorName: string | null;
+  createdAt: string;
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * Per-file activity for the Share dialog's "Activity History" tab. Reuses
+ * the existing audit log (`modules/audit`) rather than a new log — the org-
+ * wide `/audit-logs` route is admin-gated, which is the wrong bar for a file
+ * owner viewing their own file's history, so this applies the file's own
+ * permission check instead.
+ */
+export async function listFileActivity(actor: Actor, fileId: string): Promise<FileActivityEntry[]> {
+  const file = await findFileByIdUnscoped(fileId);
+  if (!file) throw AppError.notFound('File not found');
+  await requireFileAccess(actor.userId, subjectOf(file), 'editor');
+
+  const logs = await listAuditLogs({
+    organizationId: file.organization_id,
+    resourceType: 'file',
+    resourceId: fileId,
+    limit: 50,
+    offset: 0,
+  });
+
+  return logs.map((log) => ({
+    id: log.id,
+    action: log.action,
+    actorName: log.actorName,
+    createdAt: log.createdAt,
+    metadata: log.metadata,
+  }));
 }

@@ -1,3 +1,5 @@
+import type { ResourceRole } from '../../platform/authorization/roles.js';
+
 export type FileType = 'file' | 'folder';
 
 export interface FileRow {
@@ -18,6 +20,8 @@ export interface FileRow {
   deleted_at: Date | null;
   created_at: Date;
   updated_at: Date;
+  /** Count of active (non-revoked) shares on this row; only set by queries that opt in. */
+  shared_count?: string | number | null;
 }
 
 export interface FileVersionRow {
@@ -69,9 +73,16 @@ export interface FileView {
   /** Inline text content, present only for small text-like files. */
   content?: string;
   versions?: FileVersionView[];
+  /** True if anyone other than the owner currently has access. Feeds the shared-item badge. */
+  isShared: boolean;
+  /** The requesting actor's resolved access level; absent where it wasn't computed. */
+  effectiveRole?: ResourceRole;
 }
 
-export function toFileView(row: FileRow, extras: { content?: string; versions?: FileVersionView[] } = {}): FileView {
+export function toFileView(
+  row: FileRow,
+  extras: { content?: string; versions?: FileVersionView[]; effectiveRole?: ResourceRole } = {},
+): FileView {
   return {
     id: row.id,
     _id: row.id,
@@ -90,8 +101,10 @@ export function toFileView(row: FileRow, extras: { content?: string; versions?: 
     deletedAt: row.deleted_at ? row.deleted_at.toISOString() : null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
+    isShared: Number(row.shared_count ?? 0) > 0,
     ...(extras.content !== undefined ? { content: extras.content } : {}),
     ...(extras.versions !== undefined ? { versions: extras.versions } : {}),
+    ...(extras.effectiveRole !== undefined ? { effectiveRole: extras.effectiveRole } : {}),
   };
 }
 

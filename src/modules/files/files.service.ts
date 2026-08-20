@@ -3,6 +3,7 @@ import { env } from '../../platform/configuration/env.js';
 import { AppError } from '../../platform/errors/app-error.js';
 import { publishEvent } from '../../platform/events/event-bus.js';
 import { requireFileAccess } from '../../platform/authorization/access-control.js';
+import type { ResourceRole } from '../../platform/authorization/roles.js';
 import { withTransaction, type Queryable } from '../../infrastructure/database/pool.js';
 import { logger } from '../../infrastructure/observability/logger.js';
 import { objectKeys } from '../../infrastructure/storage/object-storage.js';
@@ -79,36 +80,46 @@ export async function provisionDefaultFolders(
   }
 }
 
-async function loadFileOrFail(organizationId: string, fileId: string): Promise<FileRow> {
-  const file = await repository.findFileById(organizationId, fileId);
+/**
+ * Unscoped by organization on purpose: a shared file legitimately belongs to
+ * a different organization than the actor's (every user gets their own
+ * personal org, and sharing is the path meant to cross that boundary).
+ * `requireFileAccess` below is what actually authorizes the request; scoping
+ * the lookup itself would reject a valid cross-org share before that check
+ * ever runs.
+ */
+async function loadFileOrFail(fileId: string): Promise<FileRow> {
+  const file = await repository.findFileByIdUnscoped(fileId);
   if (!file) {
     throw AppError.notFound('File not found');
   }
   return file;
 }
 
-async function assertParentIsUsableFolder(
-  organizationId: string,
-  ownerId: string,
-  parentId: string | null,
-): Promise<void> {
+/**
+ * A destination folder must exist, be a folder, and the actor must hold at
+ * least editor access to it — via ownership, an organization role, or a
+ * direct/inherited share (CLAUDE.md §17). Placing something in a folder you
+ * only have editor rights to (not ownership of) is intentionally allowed:
+ * that's what sharing a folder for collaboration means.
+ */
+async function assertParentIsUsableFolder(actorUserId: string, parentId: string | null): Promise<void> {
   if (!parentId) return;
 
-  const parent = await repository.findFileById(organizationId, parentId);
+  const parent = await repository.findFileByIdUnscoped(parentId);
   if (!parent || parent.deleted_at) {
     throw AppError.notFound('Destination folder not found');
   }
   if (parent.type !== 'folder') {
     throw AppError.validation('Destination must be a folder');
   }
-  if (parent.owner_id !== ownerId) {
-    throw AppError.permission('You cannot place files in this folder');
-  }
+  await requireFileAccess(actorUserId, subjectOf(parent), 'editor');
 }
 
 async function assertNameAvailable(input: {
-  organizationId: string;
-  ownerId: string;
+  /** Null when `parentId` is a real folder — see `files.repository.ts`. */
+  organizationId: string | null;
+  ownerId: string | null;
   parentId: string | null;
   name: string;
   exceptFileId?: string;
@@ -190,10 +201,10 @@ export async function createFile(input: CreateFileInput): Promise<FileView> {
   const parentId = input.parentId ?? null;
   const mimeType = input.mimeType || inferMimeType(name, type);
 
-  await assertParentIsUsableFolder(actor.organizationId, actor.userId, parentId);
+  await assertParentIsUsableFolder(actor.userId, parentId);
   await assertNameAvailable({
-    organizationId: actor.organizationId,
-    ownerId: actor.userId,
+    organizationId: parentId ? null : actor.organizationId,
+    ownerId: parentId ? null : actor.userId,
     parentId,
     name,
   });
@@ -284,10 +295,12 @@ export interface GetFileOptions {
 }
 
 export async function getFile(actor: Actor, fileId: string, options: GetFileOptions = {}): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
-  await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
+  const file = await loadFileOrFail(fileId);
+  const role = await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
 
-  const extras: { content?: string; versions?: FileVersionView[] } = {};
+  const extras: { content?: string; versions?: FileVersionView[]; effectiveRole?: ResourceRole } = {
+    effectiveRole: role,
+  };
 
   if (options.includeContent !== false) {
     const content = await readInlineContent(file);
@@ -309,20 +322,23 @@ export interface ListChildrenOptions {
 }
 
 export async function listChildren(actor: Actor, options: ListChildrenOptions): Promise<FileView[]> {
+  // A viewer's role on the folder governs its contents uniformly; resolving
+  // it per-child would mean one authorization query per row.
+  let role: ResourceRole = 'owner';
   if (options.parentId) {
-    const parent = await loadFileOrFail(actor.organizationId, options.parentId);
-    await requireFileAccess(actor.userId, subjectOf(parent), 'viewer');
+    const parent = await loadFileOrFail(options.parentId);
+    role = await requireFileAccess(actor.userId, subjectOf(parent), 'viewer');
   }
 
   const rows = await repository.listChildren({
-    organizationId: actor.organizationId,
-    ownerId: actor.userId,
+    organizationId: options.parentId ? null : actor.organizationId,
+    ownerId: options.parentId ? null : actor.userId,
     parentId: options.parentId,
     limit: options.limit ?? 500,
     offset: options.offset ?? 0,
   });
 
-  return decorate(rows, options.includeContent === true);
+  return decorate(rows, options.includeContent === true, role);
 }
 
 export interface UpdateFileInput {
@@ -339,7 +355,7 @@ export interface UpdateFileInput {
  * so user content is never lost (CLAUDE.md §40).
  */
 export async function updateFile(actor: Actor, fileId: string, input: UpdateFileInput): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
   const patch: repository.FilePatch = {};
@@ -348,8 +364,8 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
   if (input.name !== undefined && input.name !== file.name) {
     newName = assertValidFileName(input.name);
     await assertNameAvailable({
-      organizationId: actor.organizationId,
-      ownerId: file.owner_id,
+      organizationId: file.parent_id ? null : file.organization_id,
+      ownerId: file.parent_id ? null : file.owner_id,
       parentId: file.parent_id,
       name: newName,
       exceptFileId: fileId,
@@ -409,7 +425,7 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
   }
 
   const updated = await withTransaction(async (tx) => {
-    const row = await repository.updateFile(tx, fileId, actor.organizationId, patch, actor.userId);
+    const row = await repository.updateFile(tx, fileId, file.organization_id, patch, actor.userId);
     if (!row) throw AppError.notFound('File not found');
 
     if (input.content !== undefined) {
@@ -474,25 +490,25 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
 }
 
 export async function moveFile(actor: Actor, fileId: string, targetParentId: string | null): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
   if (targetParentId === fileId) {
     throw AppError.validation('A folder cannot be moved into itself');
   }
 
-  await assertParentIsUsableFolder(actor.organizationId, file.owner_id, targetParentId);
+  await assertParentIsUsableFolder(actor.userId, targetParentId);
 
   if (file.type === 'folder' && targetParentId) {
-    const ancestors = await repository.listAncestors(actor.organizationId, targetParentId);
+    const ancestors = await repository.listAncestors(targetParentId);
     if (ancestors.some((ancestor) => ancestor.id === fileId)) {
       throw AppError.validation('A folder cannot be moved into one of its own subfolders');
     }
   }
 
   await assertNameAvailable({
-    organizationId: actor.organizationId,
-    ownerId: file.owner_id,
+    organizationId: targetParentId ? null : file.organization_id,
+    ownerId: targetParentId ? null : file.owner_id,
     parentId: targetParentId,
     name: file.name,
     exceptFileId: fileId,
@@ -502,7 +518,7 @@ export async function moveFile(actor: Actor, fileId: string, targetParentId: str
     const updated = await repository.updateFile(
       tx,
       fileId,
-      actor.organizationId,
+      file.organization_id,
       { parentId: targetParentId },
       actor.userId,
     );
@@ -532,20 +548,20 @@ export async function moveFile(actor: Actor, fileId: string, targetParentId: str
 
 /** Soft delete. Contents stay in storage until the trash is emptied or expires. */
 export async function trashFile(actor: Actor, fileId: string): Promise<void> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
   if (file.deleted_at) return; // Idempotent: already in the trash.
 
   if (file.type === 'folder') {
-    const remaining = await repository.countChildren(actor.organizationId, fileId, file.owner_id);
+    const remaining = await repository.countChildren(null, fileId, null);
     if (remaining > 0) {
       throw AppError.conflict('This folder still contains items', { itemCount: remaining });
     }
   }
 
   await withTransaction(async (tx) => {
-    await repository.softDeleteFile(tx, fileId, actor.organizationId, actor.userId);
+    await repository.softDeleteFile(tx, fileId, file.organization_id, actor.userId);
     await recordAudit(tx, {
       organizationId: actor.organizationId,
       actorId: actor.userId,
@@ -564,7 +580,7 @@ export async function trashFile(actor: Actor, fileId: string): Promise<void> {
 }
 
 export async function restoreFile(actor: Actor, fileId: string): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
   if (!file.deleted_at) {
@@ -573,7 +589,7 @@ export async function restoreFile(actor: Actor, fileId: string): Promise<FileVie
 
   // The original folder may itself have been deleted in the meantime.
   if (file.parent_id) {
-    const parent = await repository.findFileById(actor.organizationId, file.parent_id);
+    const parent = await repository.findFileByIdUnscoped(file.parent_id);
     if (!parent || parent.deleted_at) {
       throw AppError.conflict('The original folder no longer exists. Restore it first or move this item.', {
         parentId: file.parent_id,
@@ -582,15 +598,15 @@ export async function restoreFile(actor: Actor, fileId: string): Promise<FileVie
   }
 
   await assertNameAvailable({
-    organizationId: actor.organizationId,
-    ownerId: file.owner_id,
+    organizationId: file.parent_id ? null : file.organization_id,
+    ownerId: file.parent_id ? null : file.owner_id,
     parentId: file.parent_id,
     name: file.name,
     exceptFileId: fileId,
   });
 
   const row = await withTransaction(async (tx) => {
-    const restored = await repository.restoreFile(tx, fileId, actor.organizationId);
+    const restored = await repository.restoreFile(tx, fileId, file.organization_id);
     if (!restored) throw AppError.notFound('File not found');
 
     await recordAudit(tx, {
@@ -615,17 +631,17 @@ export async function restoreFile(actor: Actor, fileId: string): Promise<FileVie
 
 /** Permanent delete: metadata now, stored objects via a background job. */
 export async function permanentlyDeleteFile(actor: Actor, fileId: string): Promise<void> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'owner');
 
-  const descendants = file.type === 'folder' ? await repository.listDescendants(actor.organizationId, fileId) : [];
+  const descendants = file.type === 'folder' ? await repository.listDescendants(fileId) : [];
   const doomed = [...descendants, file];
   const storageKeys = doomed.map((row) => row.storage_key).filter((key): key is string => Boolean(key));
   const reclaimedBytes = doomed.reduce((total, row) => total + Number(row.size), 0);
 
   await withTransaction(async (tx) => {
     for (const row of doomed) {
-      await repository.hardDeleteFile(tx, row.id, actor.organizationId);
+      await repository.hardDeleteFile(tx, row.id, row.organization_id);
     }
     await addStorageUsage(tx, actor.organizationId, -reclaimedBytes);
     await recordAudit(tx, {
@@ -683,20 +699,20 @@ export async function searchFiles(actor: Actor, term: string, limit = 50, offset
 }
 
 export async function toggleStar(actor: Actor, fileId: string): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   return updateFile(actor, fileId, { starred: !file.starred });
 }
 
 export async function togglePin(actor: Actor, fileId: string): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   return updateFile(actor, fileId, { pinned: !file.pinned });
 }
 
 export async function listBreadcrumbs(actor: Actor, fileId: string): Promise<Array<{ id: string; name: string }>> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
 
-  const ancestors = await repository.listAncestors(actor.organizationId, fileId);
+  const ancestors = await repository.listAncestors(fileId);
   return ancestors.map((row) => ({ id: row.id, name: row.name }));
 }
 
@@ -724,12 +740,12 @@ export async function uploadFile(input: UploadInput): Promise<FileView> {
     });
   }
 
-  await assertParentIsUsableFolder(actor.organizationId, actor.userId, input.parentId);
+  await assertParentIsUsableFolder(actor.userId, input.parentId);
   await assertWithinQuota(actor.organizationId, input.buffer.byteLength);
 
   const existing = await repository.findFileByNameInFolder({
-    organizationId: actor.organizationId,
-    ownerId: actor.userId,
+    organizationId: input.parentId ? null : actor.organizationId,
+    ownerId: input.parentId ? null : actor.userId,
     parentId: input.parentId,
     name,
   });
@@ -900,7 +916,7 @@ export async function createDownloadUrl(
   fileId: string,
   versionId?: string,
 ): Promise<{ url: string; filename: string; size: number; mimeType: string; expiresInSeconds: number }> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
 
   if (file.type === 'folder') {
@@ -933,7 +949,7 @@ export async function streamFile(
   actor: Actor,
   fileId: string,
 ): Promise<{ stream: NodeJS.ReadableStream; filename: string; mimeType: string; size: number }> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
 
   if (!file.storage_key) {
@@ -947,14 +963,14 @@ export async function streamFile(
 // ---------------------------------------------------------------- versions
 
 export async function listVersions(actor: Actor, fileId: string): Promise<FileVersionView[]> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
   return (await repository.listVersions(fileId)).map(toVersionView);
 }
 
 /** Restoring a version copies it forward; history is never rewritten. */
 export async function restoreVersion(actor: Actor, fileId: string, versionId: string): Promise<FileView> {
-  const file = await loadFileOrFail(actor.organizationId, fileId);
+  const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
   const version = await repository.findVersion(fileId, versionId);
@@ -970,15 +986,15 @@ function subjectOf(file: FileRow): { fileId: string; organizationId: string; own
   return { fileId: file.id, organizationId: file.organization_id, ownerId: file.owner_id };
 }
 
-async function decorate(rows: FileRow[], includeContent: boolean): Promise<FileView[]> {
+async function decorate(rows: FileRow[], includeContent: boolean, effectiveRole: ResourceRole): Promise<FileView[]> {
   if (!includeContent) {
-    return rows.map((row) => toFileView(row));
+    return rows.map((row) => toFileView(row, { effectiveRole }));
   }
 
   return Promise.all(
     rows.map(async (row) => {
       const content = await readInlineContent(row);
-      return toFileView(row, content !== undefined ? { content } : {});
+      return toFileView(row, { effectiveRole, ...(content !== undefined ? { content } : {}) });
     }),
   );
 }

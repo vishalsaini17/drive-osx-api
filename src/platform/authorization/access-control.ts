@@ -65,8 +65,27 @@ export interface FileAccessSubject {
 }
 
 /**
+ * A file's ancestor folder ids, nearest first, not including the file itself.
+ * Bounded by folder depth — cheap at this scale, no closure table needed.
+ */
+async function ancestorFolderIds(fileId: string): Promise<string[]> {
+  const rows = await queryMany<{ id: string }>(
+    `WITH RECURSIVE ancestors AS (
+       SELECT parent_id AS id FROM files WHERE id = $1
+       UNION ALL
+       SELECT f.parent_id AS id FROM files f JOIN ancestors a ON f.id = a.id WHERE f.parent_id IS NOT NULL
+     )
+     SELECT id FROM ancestors WHERE id IS NOT NULL`,
+    [fileId],
+  );
+  return rows.map((row) => row.id);
+}
+
+/**
  * Effective role a user holds on a file: ownership, organization
- * administration, direct share, or team share — strongest grant wins.
+ * administration, direct share, team share, or a share on an ancestor
+ * folder — strongest grant wins. Sharing a folder implicitly shares
+ * everything inside it, the same way a filesystem permission would.
  */
 export async function effectiveFileRole(
   userId: string,
@@ -74,19 +93,28 @@ export async function effectiveFileRole(
 ): Promise<ResourceRole | null> {
   if (file.ownerId === userId) return 'owner';
 
-  const membership = await loadMembership(userId, file.organizationId);
-  if (!membership) return null;
-
   const grants: ResourceRole[] = [];
 
-  const fromOrganization = resourceRoleFromOrganizationRole(membership.role);
-  if (fromOrganization) grants.push(fromOrganization);
+  // Organization administration only grants access within that same org — but
+  // a share can still apply even when the actor has no membership there at
+  // all, since every user gets their own personal org (CLAUDE.md/docs
+  // "Every user starts alone in their own tenant") and direct shares are the
+  // one path meant to cross that boundary. So membership is optional here,
+  // not a gate on whether shares get checked below.
+  const membership = await loadMembership(userId, file.organizationId);
+  if (membership) {
+    const fromOrganization = resourceRoleFromOrganizationRole(membership.role);
+    if (fromOrganization) grants.push(fromOrganization);
+  }
+
+  const ancestorIds = await ancestorFolderIds(file.fileId);
+  const shareableIds = [file.fileId, ...ancestorIds];
 
   const shares = await queryMany<{ role: ResourceRole }>(
     `SELECT s.role
        FROM shares s
        LEFT JOIN team_members tm ON s.principal_type = 'team' AND tm.team_id = s.principal_id
-      WHERE s.file_id = $1
+      WHERE s.file_id = ANY($1::uuid[])
         AND s.revoked_at IS NULL
         AND (s.expires_at IS NULL OR s.expires_at > now())
         AND (
@@ -94,7 +122,7 @@ export async function effectiveFileRole(
           OR (s.principal_type = 'team' AND tm.user_id = $2)
           OR s.principal_type = 'organization'
         )`,
-    [file.fileId, userId],
+    [shareableIds, userId],
   );
 
   grants.push(...shares.map((share) => share.role));
