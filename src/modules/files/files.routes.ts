@@ -41,6 +41,7 @@ fileRoutes.get('/:fileId/download', controller.downloadUrl);
 fileRoutes.get('/:fileId/content', controller.downloadStream);
 fileRoutes.get('/:fileId/versions', controller.listVersions);
 fileRoutes.post('/:fileId/versions/:versionId/restore', controller.restoreVersion);
+fileRoutes.post('/:fileId/duplicate', controller.duplicate);
 
 fileRoutes.patch('/:fileId', controller.update);
 fileRoutes.patch('/:fileId/move', controller.move);

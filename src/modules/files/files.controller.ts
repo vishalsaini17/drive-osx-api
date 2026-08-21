@@ -28,7 +28,10 @@ const updateSchema = z
   .refine((value) => Object.keys(value).length > 0, { message: 'Provide at least one field to update' });
 
 const moveSchema = z.object({ parentId: z.string().uuid().nullable() });
-const downloadZipSchema = z.object({ fileIds: z.array(z.string().uuid()).min(1).max(200) });
+const downloadZipSchema = z.object({
+  fileIds: z.array(z.string().uuid()).min(1).max(200),
+  partIndex: z.coerce.number().int().min(0).default(0),
+});
 
 const fileParams = z.object({ fileId: z.string().uuid('Invalid file id') });
 const versionParams = fileParams.extend({ versionId: z.string().uuid('Invalid version id') });
@@ -105,6 +108,13 @@ export const move = asyncHandler(async (req: Request, res: Response) => {
   const { parentId } = parseBody(moveSchema, req);
   const file = await service.moveFile(actorOf(req), fileId, parentId);
   res.json({ message: 'File moved', file });
+});
+
+export const duplicate = asyncHandler(async (req: Request, res: Response) => {
+  const { fileId } = parseParams(fileParams, req);
+  const { parentId } = parseBody(moveSchema.partial(), req);
+  const file = await service.duplicateFile(actorOf(req), fileId, parentId);
+  res.status(201).json({ message: 'File duplicated', file });
 });
 
 export const trash = asyncHandler(async (req: Request, res: Response) => {
@@ -217,26 +227,46 @@ export const downloadStream = asyncHandler(async (req: Request, res: Response) =
  * Zips a multi-selection (files and/or whole folders) on the fly. Entries
  * are streamed straight from object storage into the archive and from the
  * archive into the response — nothing is buffered in full on the server.
+ *
+ * A selection over 1GiB is served as several parts rather than one giant
+ * archive (which the browser would otherwise have to hold entirely in memory
+ * as a single blob). The split is deterministic from `fileIds` alone, so the
+ * client requests `partIndex: 0`, reads `X-Total-Parts` off the response,
+ * and — if it's more than 1 — requests the rest in turn; the server never
+ * has to remember anything about the request between calls.
  */
-export const downloadZip = asyncHandler(async (req: Request, res: Response) => {
-  const { fileIds } = parseBody(downloadZipSchema, req);
-  const { entries, suggestedName, totalBytes } = await service.collectZipEntries(actorOf(req), fileIds);
+// Opening each object's read stream is its own round trip to storage; doing
+// that one entry at a time serialized N round trips of pure latency before
+// any compressing/writing even started. Prefetching a handful at once
+// overlaps that latency instead of paying it N times in a row.
+const ZIP_PREFETCH_CONCURRENCY = 6;
 
-  const archive = new ZipArchive({ zlib: { level: 6 } });
+export const downloadZip = asyncHandler(async (req: Request, res: Response) => {
+  const { fileIds, partIndex } = parseBody(downloadZipSchema, req);
+  const { entries, filename, totalParts, partBytes } = await service.getZipPart(actorOf(req), fileIds, partIndex);
+
+  // Level 1: fast compression, not maximum. Zip here is a bundling format
+  // more than a size optimization — most real-world selections are already
+  // partly incompressible formats (images, video, PDFs) where level 6 spends
+  // much more CPU than level 1 for a negligible size difference.
+  const archive = new ZipArchive({ zlib: { level: 1 } });
 
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="${suggestedName.replace(/"/g, '')}"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+  res.setHeader('X-Part-Index', String(partIndex));
+  res.setHeader('X-Total-Parts', String(totalParts));
   // Approximate — the archive is compressed, so actual bytes transferred will
   // land at or under this. Good enough for a progress indicator; exact size
   // isn't knowable before the archive is fully built.
-  res.setHeader('X-Uncompressed-Size', String(totalBytes));
+  res.setHeader('X-Uncompressed-Size', String(partBytes));
 
   archive.on('error', (error: Error) => res.destroy(error));
   archive.pipe(res);
 
-  for (const entry of entries) {
-    const stream = await service.streamZipEntry(entry.storageKey);
-    archive.append(stream, { name: entry.archivePath });
+  for (let i = 0; i < entries.length; i += ZIP_PREFETCH_CONCURRENCY) {
+    const batch = entries.slice(i, i + ZIP_PREFETCH_CONCURRENCY);
+    const streams = await Promise.all(batch.map((entry) => service.streamZipEntry(entry.storageKey)));
+    streams.forEach((stream, idx) => archive.append(stream, { name: batch[idx]!.archivePath }));
   }
 
   await archive.finalize();

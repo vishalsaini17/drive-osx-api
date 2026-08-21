@@ -290,6 +290,241 @@ export async function createFile(input: CreateFileInput): Promise<FileView> {
   }
 }
 
+/** "report.pdf" → "report - Copy.pdf" → "report - Copy (2).pdf" — the naming a desktop OS uses for "Make a copy". */
+function suggestCopyName(name: string, attempt: number): string {
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  return attempt === 1 ? `${base} - Copy${ext}` : `${base} - Copy (${attempt})${ext}`;
+}
+
+async function findAvailableCopyName(
+  organizationId: string | null,
+  ownerId: string | null,
+  parentId: string | null,
+  sourceName: string,
+): Promise<string> {
+  for (let attempt = 1; ; attempt += 1) {
+    const candidate = suggestCopyName(sourceName, attempt);
+    const existing = await repository.findFileByNameInFolder({ organizationId, ownerId, parentId, name: candidate });
+    if (!existing) return candidate;
+  }
+}
+
+const MAX_DUPLICATE_ENTRIES = 2000;
+
+/**
+ * Makes a real, independent copy — a new database row plus (for a file) a
+ * server-side copy of the stored object via `objectStorage.copy`, not a
+ * client-side stub with a fabricated id. Anything duplicated this way is a
+ * fully real file/folder the instant it's created, so renaming, deleting,
+ * moving, sharing, and downloading it all work exactly like they would for
+ * anything else — because it *is* anything else, not a local-only shadow
+ * that the next backend-driven refresh would quietly discard.
+ */
+export async function duplicateFile(actor: Actor, fileId: string, targetParentId?: string | null): Promise<FileView> {
+  const source = await loadFileOrFail(fileId);
+  await requireFileAccess(actor.userId, subjectOf(source), 'viewer');
+
+  const parentId = targetParentId !== undefined ? targetParentId : source.parent_id;
+  await assertParentIsUsableFolder(actor.userId, parentId);
+
+  const scopeOwnerId = parentId ? null : actor.userId;
+  const scopeOrganizationId = parentId ? null : actor.organizationId;
+  const newName = await findAvailableCopyName(scopeOrganizationId, scopeOwnerId, parentId, source.name);
+
+  if (source.type === 'file') {
+    return duplicateSingleFile(actor, source, parentId, newName);
+  }
+  return duplicateFolderTree(actor, source, parentId, newName);
+}
+
+async function duplicateSingleFile(
+  actor: Actor,
+  source: FileRow,
+  parentId: string | null,
+  newName: string,
+): Promise<FileView> {
+  const size = Number(source.size);
+  await assertWithinQuota(actor.organizationId, size);
+
+  const newId = randomUUID();
+  let newStorageKey: string | null = null;
+  if (source.storage_key) {
+    newStorageKey = objectKeys.original(actor.organizationId, newId);
+    await objectStorage.copy(source.storage_key, newStorageKey);
+  }
+
+  const content = await readInlineContent(source);
+
+  try {
+    const row = await withTransaction(async (tx) => {
+      const created = await repository.insertFile(tx, {
+        id: newId,
+        organizationId: actor.organizationId,
+        ownerId: actor.userId,
+        parentId,
+        name: newName,
+        type: 'file',
+        mimeType: source.mime_type,
+        size,
+        storageKey: newStorageKey,
+        checksum: source.checksum,
+        metadata: source.metadata ?? {},
+        contentText: content && isTextLike(source.mime_type) ? content.slice(0, 100_000) : null,
+        createdBy: actor.userId,
+      });
+
+      if (newStorageKey) {
+        await repository.insertVersion(tx, {
+          fileId: newId,
+          versionNo: 1,
+          storageKey: newStorageKey,
+          size,
+          checksum: source.checksum,
+          mimeType: source.mime_type,
+          comment: `Copy of "${source.name}"`,
+          createdBy: actor.userId,
+        });
+        await addStorageUsage(tx, actor.organizationId, size);
+      }
+
+      await recordAudit(tx, {
+        organizationId: actor.organizationId,
+        actorId: actor.userId,
+        action: 'file.duplicated',
+        resourceType: 'file',
+        resourceId: newId,
+        metadata: { sourceFileId: source.id, name: newName, parentId },
+      });
+
+      await publishEvent(
+        tx,
+        'file.uploaded',
+        { organizationId: actor.organizationId, fileId: newId, ownerId: actor.userId, mimeType: source.mime_type, size },
+        { organizationId: actor.organizationId, actorId: actor.userId },
+      );
+
+      return created;
+    });
+
+    return toFileView(row, { content: content ?? undefined });
+  } catch (error) {
+    if (newStorageKey) await objectStorage.delete(newStorageKey).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function duplicateFolderTree(
+  actor: Actor,
+  source: FileRow,
+  parentId: string | null,
+  newName: string,
+): Promise<FileView> {
+  const descendants = (await repository.listDescendants(source.id)).slice().reverse(); // shallowest first
+  if (descendants.length > MAX_DUPLICATE_ENTRIES) {
+    throw AppError.validation(`Folder is too large to duplicate (limit is ${MAX_DUPLICATE_ENTRIES} items)`);
+  }
+
+  const totalBytes = descendants.reduce((sum, row) => sum + (row.type === 'file' ? Number(row.size) : 0), 0);
+  await assertWithinQuota(actor.organizationId, totalBytes);
+
+  const newFolderId = randomUUID();
+  const newFolderRow = await withTransaction((tx) =>
+    repository.insertFile(tx, {
+      id: newFolderId,
+      organizationId: actor.organizationId,
+      ownerId: actor.userId,
+      parentId,
+      name: newName,
+      type: 'folder',
+      mimeType: 'folder',
+      size: 0,
+      storageKey: null,
+      metadata: source.metadata ?? {},
+      createdBy: actor.userId,
+    }),
+  );
+
+  const idMap = new Map<string, string>([[source.id, newFolderId]]);
+
+  for (const row of descendants) {
+    const newId = randomUUID();
+    const mappedParentId = (row.parent_id && idMap.get(row.parent_id)) || newFolderId;
+    idMap.set(row.id, newId);
+
+    if (row.type === 'folder') {
+      await withTransaction((tx) =>
+        repository.insertFile(tx, {
+          id: newId,
+          organizationId: actor.organizationId,
+          ownerId: actor.userId,
+          parentId: mappedParentId,
+          name: row.name,
+          type: 'folder',
+          mimeType: 'folder',
+          size: 0,
+          storageKey: null,
+          metadata: row.metadata ?? {},
+          createdBy: actor.userId,
+        }),
+      );
+      continue;
+    }
+
+    const size = Number(row.size);
+    let newStorageKey: string | null = null;
+    if (row.storage_key) {
+      newStorageKey = objectKeys.original(actor.organizationId, newId);
+      await objectStorage.copy(row.storage_key, newStorageKey);
+    }
+
+    await withTransaction(async (tx) => {
+      await repository.insertFile(tx, {
+        id: newId,
+        organizationId: actor.organizationId,
+        ownerId: actor.userId,
+        parentId: mappedParentId,
+        name: row.name,
+        type: 'file',
+        mimeType: row.mime_type,
+        size,
+        storageKey: newStorageKey,
+        checksum: row.checksum,
+        metadata: row.metadata ?? {},
+        createdBy: actor.userId,
+      });
+
+      if (newStorageKey) {
+        await repository.insertVersion(tx, {
+          fileId: newId,
+          versionNo: 1,
+          storageKey: newStorageKey,
+          size,
+          checksum: row.checksum,
+          mimeType: row.mime_type,
+          comment: 'Initial version',
+          createdBy: actor.userId,
+        });
+        await addStorageUsage(tx, actor.organizationId, size);
+      }
+    });
+  }
+
+  await withTransaction((tx) =>
+    recordAudit(tx, {
+      organizationId: actor.organizationId,
+      actorId: actor.userId,
+      action: 'folder.duplicated',
+      resourceType: 'file',
+      resourceId: newFolderId,
+      metadata: { sourceFileId: source.id, name: newName, parentId, itemCount: descendants.length },
+    }),
+  );
+
+  return toFileView(newFolderRow);
+}
+
 export interface GetFileOptions {
   includeContent?: boolean;
   includeVersions?: boolean;
@@ -1033,6 +1268,73 @@ export async function collectZipEntries(
   const suggestedName = fileIds.length === 1 && singleName ? `${singleName}.zip` : 'Download.zip';
   const totalBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
   return { entries, suggestedName, totalBytes };
+}
+
+const MAX_ZIP_PART_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
+interface ZipPart {
+  entries: ZipEntry[];
+  partBytes: number;
+}
+
+/**
+ * Splits a flat entry list into ≤1GiB chunks so a multi-gigabyte selection
+ * downloads as several ordinary-sized zip files instead of one archive the
+ * browser has to hold entirely in memory as a single blob. A single entry
+ * larger than the cap still gets a part of its own — there's no way to split
+ * inside one file.
+ */
+export function splitIntoZipParts(entries: ZipEntry[], maxPartBytes: number): ZipPart[] {
+  const parts: ZipPart[] = [];
+  let current: ZipEntry[] = [];
+  let currentBytes = 0;
+
+  for (const entry of entries) {
+    if (current.length > 0 && currentBytes + entry.size > maxPartBytes) {
+      parts.push({ entries: current, partBytes: currentBytes });
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(entry);
+    currentBytes += entry.size;
+  }
+  if (current.length > 0) parts.push({ entries: current, partBytes: currentBytes });
+  return parts;
+}
+
+/**
+ * Resolves one part of a (possibly multi-part) zip download. Stateless and
+ * deterministic on purpose: the same `fileIds` always split into the same
+ * parts in the same order, so the client can request part 0, learn the total
+ * part count from the response, and then request 1..N-1 in turn without the
+ * server having to remember anything about the request in between.
+ */
+export async function getZipPart(
+  actor: Actor,
+  fileIds: string[],
+  partIndex: number,
+): Promise<{ entries: ZipEntry[]; filename: string; partIndex: number; totalParts: number; partBytes: number }> {
+  const { entries, suggestedName, totalBytes } = await collectZipEntries(actor, fileIds);
+  const parts =
+    totalBytes > MAX_ZIP_PART_BYTES
+      ? splitIntoZipParts(entries, MAX_ZIP_PART_BYTES)
+      : [{ entries, partBytes: totalBytes }];
+
+  const part = parts[partIndex];
+  if (!part) {
+    throw AppError.validation(`Invalid part index ${partIndex} — this download has ${parts.length} part(s)`);
+  }
+
+  const baseName = suggestedName.replace(/\.zip$/i, '');
+  const filename = parts.length > 1 ? `${baseName} (Part ${partIndex + 1} of ${parts.length}).zip` : suggestedName;
+
+  return {
+    entries: part.entries,
+    filename,
+    partIndex,
+    totalParts: parts.length,
+    partBytes: part.partBytes,
+  };
 }
 
 /** Storage-provider detail stays behind the service, even for zip entries. */
