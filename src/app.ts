@@ -34,7 +34,7 @@ export function createApp(): Express {
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'X-Organization-Id', 'X-Request-Id'],
-      exposedHeaders: ['X-Request-Id', 'X-RateLimit-Remaining'],
+      exposedHeaders: ['X-Request-Id', 'X-RateLimit-Remaining', 'X-Uncompressed-Size'],
     }),
   );
 

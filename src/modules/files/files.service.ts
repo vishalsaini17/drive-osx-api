@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { Readable } from 'node:stream';
 import { env } from '../../platform/configuration/env.js';
 import { AppError } from '../../platform/errors/app-error.js';
 import { publishEvent } from '../../platform/events/event-bus.js';
@@ -958,6 +959,85 @@ export async function streamFile(
 
   const stream = await objectStorage.getStream(file.storage_key);
   return { stream, filename: file.name, mimeType: file.mime_type, size: Number(file.size) };
+}
+
+const MAX_ZIP_ENTRIES = 2000;
+
+export interface ZipEntry {
+  storageKey: string;
+  /** Path inside the archive, e.g. "Notes/Sub Folder/report.pdf". */
+  archivePath: string;
+  size: number;
+}
+
+/**
+ * Flattens a selection of files/folders into archive entries. Each top-level
+ * item becomes its own root in the zip (a file stays a single entry, a
+ * folder becomes a directory of its full subtree) — the same shape a desktop
+ * OS produces when you "compress" a multi-selection. Access is checked once
+ * per top-level item; everything under an authorized folder is already
+ * reachable through it (the same trust boundary `listChildren` relies on).
+ */
+export async function collectZipEntries(
+  actor: Actor,
+  fileIds: string[],
+): Promise<{ entries: ZipEntry[]; suggestedName: string; totalBytes: number }> {
+  if (fileIds.length === 0) {
+    throw AppError.validation('Select at least one item to download');
+  }
+
+  const usedNames = new Set<string>();
+  const entries: ZipEntry[] = [];
+  let singleName: string | null = null;
+
+  for (const fileId of fileIds) {
+    const file = await loadFileOrFail(fileId);
+    await requireFileAccess(actor.userId, subjectOf(file), 'viewer');
+
+    let rootName = file.name;
+    while (usedNames.has(rootName)) rootName = `${file.name} (${usedNames.size})`;
+    usedNames.add(rootName);
+    singleName = fileIds.length === 1 ? file.name : singleName;
+
+    if (file.type === 'file') {
+      if (file.storage_key) entries.push({ storageKey: file.storage_key, archivePath: rootName, size: Number(file.size) });
+      continue;
+    }
+
+    const descendants = await repository.listDescendants(fileId);
+    const byId = new Map(descendants.map((row) => [row.id, row]));
+    for (const row of descendants) {
+      if (row.type !== 'file' || !row.storage_key) continue;
+
+      const segments: string[] = [row.name];
+      let parentId = row.parent_id;
+      while (parentId && parentId !== fileId) {
+        const parent = byId.get(parentId);
+        if (!parent) break;
+        segments.unshift(parent.name);
+        parentId = parent.parent_id;
+      }
+      segments.unshift(rootName);
+      entries.push({ storageKey: row.storage_key, archivePath: segments.join('/'), size: Number(row.size) });
+
+      if (entries.length > MAX_ZIP_ENTRIES) {
+        throw AppError.validation(`Selection is too large to zip (limit is ${MAX_ZIP_ENTRIES} files)`);
+      }
+    }
+  }
+
+  if (entries.length === 0) {
+    throw AppError.validation('Nothing to download — the selection has no files');
+  }
+
+  const suggestedName = fileIds.length === 1 && singleName ? `${singleName}.zip` : 'Download.zip';
+  const totalBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
+  return { entries, suggestedName, totalBytes };
+}
+
+/** Storage-provider detail stays behind the service, even for zip entries. */
+export function streamZipEntry(storageKey: string): Promise<Readable> {
+  return objectStorage.getStream(storageKey);
 }
 
 // ---------------------------------------------------------------- versions

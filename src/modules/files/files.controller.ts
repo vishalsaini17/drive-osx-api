@@ -1,4 +1,5 @@
 import type { Request, Response } from 'express';
+import { ZipArchive } from 'archiver';
 import { z } from 'zod';
 import { requireOrganization } from '../../platform/authentication/authenticate.js';
 import { asyncHandler } from '../../platform/http/async-handler.js';
@@ -27,6 +28,7 @@ const updateSchema = z
   .refine((value) => Object.keys(value).length > 0, { message: 'Provide at least one field to update' });
 
 const moveSchema = z.object({ parentId: z.string().uuid().nullable() });
+const downloadZipSchema = z.object({ fileIds: z.array(z.string().uuid()).min(1).max(200) });
 
 const fileParams = z.object({ fileId: z.string().uuid('Invalid file id') });
 const versionParams = fileParams.extend({ versionId: z.string().uuid('Invalid version id') });
@@ -209,6 +211,35 @@ export const downloadStream = asyncHandler(async (req: Request, res: Response) =
     // Headers are already sent; end the response rather than attempting JSON.
     res.destroy(error);
   });
+});
+
+/**
+ * Zips a multi-selection (files and/or whole folders) on the fly. Entries
+ * are streamed straight from object storage into the archive and from the
+ * archive into the response — nothing is buffered in full on the server.
+ */
+export const downloadZip = asyncHandler(async (req: Request, res: Response) => {
+  const { fileIds } = parseBody(downloadZipSchema, req);
+  const { entries, suggestedName, totalBytes } = await service.collectZipEntries(actorOf(req), fileIds);
+
+  const archive = new ZipArchive({ zlib: { level: 6 } });
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${suggestedName.replace(/"/g, '')}"`);
+  // Approximate — the archive is compressed, so actual bytes transferred will
+  // land at or under this. Good enough for a progress indicator; exact size
+  // isn't knowable before the archive is fully built.
+  res.setHeader('X-Uncompressed-Size', String(totalBytes));
+
+  archive.on('error', (error: Error) => res.destroy(error));
+  archive.pipe(res);
+
+  for (const entry of entries) {
+    const stream = await service.streamZipEntry(entry.storageKey);
+    archive.append(stream, { name: entry.archivePath });
+  }
+
+  await archive.finalize();
 });
 
 export const listVersions = asyncHandler(async (req: Request, res: Response) => {

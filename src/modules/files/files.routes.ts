@@ -25,6 +25,7 @@ fileRoutes.get('/pinned', controller.listPinned);
 fileRoutes.get('/recent', controller.listRecent);
 fileRoutes.get('/children', controller.listChildren);
 fileRoutes.get('/children/:parentId', controller.listChildren);
+fileRoutes.post('/download-zip', controller.downloadZip);
 
 fileRoutes.post('/', controller.create);
 fileRoutes.post(

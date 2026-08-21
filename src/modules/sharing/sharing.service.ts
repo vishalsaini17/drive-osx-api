@@ -328,15 +328,28 @@ export async function listSharesForFile(actor: Actor, fileId: string): Promise<S
 }
 
 /** Files other people have shared with the signed-in user. */
-export async function listSharedWithMe(actor: Actor): Promise<Array<FileView & { sharedRole: ResourceRole }>> {
-  const rows = await queryMany<Parameters<typeof toFileView>[0] & { shared_role: ResourceRole }>(
+export async function listSharedWithMe(
+  actor: Actor,
+): Promise<
+  Array<FileView & { sharedRole: ResourceRole; sharedAt: string; ownerName: string | null; ownerUsername: string | null }>
+> {
+  const rows = await queryMany<
+    Parameters<typeof toFileView>[0] & {
+      shared_role: ResourceRole;
+      shared_at: Date;
+      owner_name: string | null;
+      owner_username: string | null;
+    }
+  >(
     `SELECT DISTINCT ON (f.id)
             f.id, f.organization_id, f.owner_id, f.parent_id, f.name, f.type, f.mime_type, f.size,
             f.storage_key, f.checksum, f.starred, f.pinned, f.version_no, f.metadata, f.deleted_at,
-            f.created_at, f.updated_at, s.role AS shared_role
+            f.created_at, f.updated_at, s.role AS shared_role, s.created_at AS shared_at,
+            u.full_name AS owner_name, u.username AS owner_username
        FROM shares s
        JOIN files f ON f.id = s.file_id
        LEFT JOIN team_members tm ON s.principal_type = 'team' AND tm.team_id = s.principal_id
+       LEFT JOIN users u ON u.id = f.owner_id
       WHERE s.revoked_at IS NULL
         AND (s.expires_at IS NULL OR s.expires_at > now())
         AND f.deleted_at IS NULL
@@ -345,11 +358,17 @@ export async function listSharedWithMe(actor: Actor): Promise<Array<FileView & {
           (s.principal_type = 'user' AND s.principal_id = $1)
           OR (s.principal_type = 'team' AND tm.user_id = $1)
         )
-      ORDER BY f.id, f.updated_at DESC`,
+      ORDER BY f.id, s.created_at DESC`,
     [actor.userId],
   );
 
-  return rows.map((row) => ({ ...toFileView(row), sharedRole: row.shared_role }));
+  return rows.map((row) => ({
+    ...toFileView(row),
+    ownerUsername: row.owner_username,
+    sharedRole: row.shared_role,
+    sharedAt: row.shared_at.toISOString(),
+    ownerName: row.owner_name,
+  }));
 }
 
 export async function revokeShare(actor: Actor, shareId: string): Promise<void> {
