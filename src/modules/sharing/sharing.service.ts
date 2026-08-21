@@ -19,6 +19,8 @@ export interface ShareView {
   principalType: 'user' | 'team' | 'organization' | 'link';
   principalId: string | null;
   principalName: string | null;
+  /** Only set for `principalType === 'user'`; teams/links have no @handle. */
+  principalUsername: string | null;
   role: ResourceRole;
   message: string | null;
   expiresAt: string | null;
@@ -32,6 +34,7 @@ interface ShareRow {
   principal_type: ShareView['principalType'];
   principal_id: string | null;
   principal_name: string | null;
+  principal_username: string | null;
   role: ResourceRole;
   message: string | null;
   expires_at: Date | null;
@@ -46,6 +49,7 @@ export function toShareView(row: ShareRow): ShareView {
     principalType: row.principal_type,
     principalId: row.principal_id,
     principalName: row.principal_name,
+    principalUsername: row.principal_username,
     role: row.role,
     message: row.message,
     expiresAt: row.expires_at ? row.expires_at.toISOString() : null,
@@ -57,7 +61,8 @@ export function toShareView(row: ShareRow): ShareView {
 const SHARE_SELECT = `
   SELECT s.id, s.file_id, s.principal_type, s.principal_id, s.role, s.message,
          s.expires_at, s.created_at, s.shared_by,
-         COALESCE(u.full_name, t.name) AS principal_name
+         COALESCE(u.full_name, t.name) AS principal_name,
+         u.username AS principal_username
     FROM shares s
     LEFT JOIN users u ON s.principal_type = 'user' AND u.id = s.principal_id
     LEFT JOIN teams t ON s.principal_type = 'team' AND t.id = s.principal_id

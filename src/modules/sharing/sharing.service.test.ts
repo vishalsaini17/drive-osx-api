@@ -42,6 +42,7 @@ describe('toShareView', () => {
     principal_type: 'user' as const,
     principal_id: 'user-2',
     principal_name: 'Mukesh Kumar',
+    principal_username: 'mukesh',
     role: 'viewer' as const,
     message: null,
     expires_at: null,
@@ -56,6 +57,7 @@ describe('toShareView', () => {
       principalType: 'user',
       principalId: 'user-2',
       principalName: 'Mukesh Kumar',
+      principalUsername: 'mukesh',
       role: 'viewer',
       message: null,
       expiresAt: null,
@@ -69,10 +71,17 @@ describe('toShareView', () => {
     expect(view.expiresAt).toBe('2026-02-01T00:00:00.000Z');
   });
 
-  it('has no principal name for a public link', () => {
-    const view = toShareView({ ...baseRow, principal_type: 'link', principal_id: null, principal_name: null });
+  it('has no principal name or username for a public link', () => {
+    const view = toShareView({
+      ...baseRow,
+      principal_type: 'link',
+      principal_id: null,
+      principal_name: null,
+      principal_username: null,
+    });
     expect(view.principalType).toBe('link');
     expect(view.principalId).toBeNull();
     expect(view.principalName).toBeNull();
+    expect(view.principalUsername).toBeNull();
   });
 });
