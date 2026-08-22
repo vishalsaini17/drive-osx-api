@@ -82,6 +82,24 @@ export async function provisionDefaultFolders(
 }
 
 /**
+ * Default folders (Documents, Pictures, Videos, Music) are provisioned with
+ * `metadata.system = true` and are meant to be a fixed set of root-level
+ * places — the sidebar and `resolveDefaultFolderId` on the frontend look
+ * them up by name at the root. Deleting, renaming or relocating one would
+ * silently break those lookups, so the identity-changing operations below
+ * refuse to act on them regardless of who owns them.
+ */
+export function isSystemFolder(file: FileRow): boolean {
+  return file.type === 'folder' && file.metadata?.system === true;
+}
+
+export function assertNotSystemFolder(file: FileRow, action: string): void {
+  if (isSystemFolder(file)) {
+    throw AppError.validation(`"${file.name}" is a default folder and cannot be ${action}`);
+  }
+}
+
+/**
  * Unscoped by organization on purpose: a shared file legitimately belongs to
  * a different organization than the actor's (every user gets their own
  * personal org, and sharing is the path meant to cross that boundary).
@@ -429,6 +447,12 @@ async function duplicateFolderTree(
   const totalBytes = descendants.reduce((sum, row) => sum + (row.type === 'file' ? Number(row.size) : 0), 0);
   await assertWithinQuota(actor.organizationId, totalBytes);
 
+  // A duplicate of a default folder (Documents, Pictures, …) is an ordinary
+  // folder, not another fixed root location — copying `metadata.system`
+  // along with it would produce a folder the user could never rename,
+  // move or delete.
+  const { system: _sourceIsSystem, ...duplicatedMetadata } = source.metadata ?? {};
+
   const newFolderId = randomUUID();
   const newFolderRow = await withTransaction((tx) =>
     repository.insertFile(tx, {
@@ -441,7 +465,7 @@ async function duplicateFolderTree(
       mimeType: 'folder',
       size: 0,
       storageKey: null,
-      metadata: source.metadata ?? {},
+      metadata: duplicatedMetadata,
       createdBy: actor.userId,
     }),
   );
@@ -598,6 +622,7 @@ export async function updateFile(actor: Actor, fileId: string, input: UpdateFile
   let newName: string | undefined;
 
   if (input.name !== undefined && input.name !== file.name) {
+    assertNotSystemFolder(file, 'renamed');
     newName = assertValidFileName(input.name);
     await assertNameAvailable({
       organizationId: file.parent_id ? null : file.organization_id,
@@ -733,6 +758,7 @@ export async function moveFile(actor: Actor, fileId: string, targetParentId: str
     throw AppError.validation('A folder cannot be moved into itself');
   }
 
+  assertNotSystemFolder(file, 'moved');
   await assertParentIsUsableFolder(actor.userId, targetParentId);
 
   if (file.type === 'folder' && targetParentId) {
@@ -788,6 +814,8 @@ export async function trashFile(actor: Actor, fileId: string): Promise<void> {
   await requireFileAccess(actor.userId, subjectOf(file), 'editor');
 
   if (file.deleted_at) return; // Idempotent: already in the trash.
+
+  assertNotSystemFolder(file, 'deleted');
 
   if (file.type === 'folder') {
     const remaining = await repository.countChildren(null, fileId, null);
@@ -869,6 +897,8 @@ export async function restoreFile(actor: Actor, fileId: string): Promise<FileVie
 export async function permanentlyDeleteFile(actor: Actor, fileId: string): Promise<void> {
   const file = await loadFileOrFail(fileId);
   await requireFileAccess(actor.userId, subjectOf(file), 'owner');
+
+  assertNotSystemFolder(file, 'deleted');
 
   const descendants = file.type === 'folder' ? await repository.listDescendants(fileId) : [];
   const doomed = [...descendants, file];
