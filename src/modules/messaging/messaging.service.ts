@@ -110,6 +110,16 @@ export interface MessageView {
   isMine: boolean;
   /** Present only when `isMine` — single/double/blue tick. */
   status?: MessageDeliveryStatus;
+  /** Set once this message is pinned in its conversation — see `setMessagePinned`. */
+  pinnedAt: string | null;
+  /** True for a message created by `forwardMessage` — the client's "Forwarded" label. */
+  isForwarded: boolean;
+  /**
+   * True once the sender has deleted this message "for everyone" — `body`
+   * and `attachments` are already cleared server-side at that point, so the
+   * client just needs to know to render a placeholder instead of them.
+   */
+  isDeleted: boolean;
   createdAt: string;
 }
 
@@ -124,6 +134,9 @@ interface MessageRow {
   reactions: Record<string, string[]>;
   mentions: string[];
   is_edited: boolean;
+  pinned_at: string | null;
+  forwarded: boolean;
+  deleted_at: string | null;
   created_at: string;
 }
 
@@ -995,6 +1008,7 @@ export async function listMedia(actor: Actor, conversationId: string): Promise<M
          ON cp.conversation_id = m.conversation_id AND cp.user_id = $2
       WHERE m.conversation_id = $1
         AND m.deleted_at IS NULL
+        AND NOT ($2 = ANY(m.deleted_for))
         AND jsonb_array_length(m.attachments) > 0
         AND (cp.history_cleared_at IS NULL OR m.created_at > cp.history_cleared_at)
       ORDER BY m.created_at DESC`,
@@ -1033,14 +1047,18 @@ export async function listMessages(
   const limit = Math.min(options.limit ?? 50, 200);
   const rows = await queryMany(
     `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.thread_parent_id, m.reply_to_id,
-            m.attachments, m.reactions, m.mentions, m.is_edited, m.created_at,
+            m.attachments, m.reactions, m.mentions, m.is_edited, m.pinned_at, m.forwarded,
+            m.deleted_at, m.created_at,
             coalesce(u.full_name, 'Removed user') AS sender_name
        FROM messages m
        JOIN conversation_participants cp
          ON cp.conversation_id = m.conversation_id AND cp.user_id = $4
        LEFT JOIN users u ON u.id = m.sender_id
       WHERE m.conversation_id = $1
-        AND m.deleted_at IS NULL
+        -- A "deleted for everyone" message stays in the thread as a
+        -- tombstone (body/attachments already cleared — see deleteMessage);
+        -- only "deleted for me" actually removes it from this query.
+        AND NOT ($4 = ANY(m.deleted_for))
         AND ($2::timestamptz IS NULL OR m.created_at < $2)
         -- A cleared history stays cleared even after the conversation
         -- reappears (see deleteConversation's doc comment).
@@ -1078,9 +1096,55 @@ export async function listMessages(
       ...(row.sender_id === actor.userId
         ? { status: computeMessageStatus(new Date(row.created_at), others) }
         : {}),
+      pinnedAt: row.pinned_at ? new Date(row.pinned_at).toISOString() : null,
+      isForwarded: row.forwarded,
+      isDeleted: row.deleted_at !== null,
       createdAt: new Date(row.created_at).toISOString(),
     })),
   );
+}
+
+/**
+ * Hydrates a single message by id into its API view — the shared tail end of
+ * reacting, pinning, and forwarding, all of which mutate one row and then
+ * need to hand the caller back the same shape `listMessages` produces.
+ */
+async function getMessageView(actor: Actor, messageId: string): Promise<MessageView> {
+  const row = await queryOne(
+    `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.thread_parent_id, m.reply_to_id,
+            m.attachments, m.reactions, m.mentions, m.is_edited, m.pinned_at, m.forwarded,
+            m.deleted_at, m.created_at,
+            coalesce(u.full_name, 'Removed user') AS sender_name
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+      WHERE m.id = $1`,
+    [messageId],
+  );
+  if (!row) throw AppError.notFound('Message not found');
+
+  const others = await otherParticipantWatermarks(row.conversation_id, actor.userId);
+
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    senderId: row.sender_id,
+    senderName: row.sender_name,
+    body: row.body,
+    threadParentId: row.thread_parent_id,
+    replyToId: row.reply_to_id,
+    attachments: await resolveAttachments(row.attachments ?? []),
+    reactions: row.reactions ?? {},
+    mentions: row.mentions ?? [],
+    isEdited: row.is_edited,
+    isMine: row.sender_id === actor.userId,
+    ...(row.sender_id === actor.userId
+      ? { status: computeMessageStatus(new Date(row.created_at), others) }
+      : {}),
+    pinnedAt: row.pinned_at ? new Date(row.pinned_at).toISOString() : null,
+    isForwarded: row.forwarded,
+    isDeleted: row.deleted_at !== null,
+    createdAt: new Date(row.created_at).toISOString(),
+  };
 }
 
 export async function sendMessage(
@@ -1098,7 +1162,7 @@ export async function sendMessage(
       `INSERT INTO messages (conversation_id, organization_id, sender_id, body, reply_to_id, thread_parent_id, mentions)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id, conversation_id, sender_id, body, thread_parent_id, reply_to_id,
-                   attachments, reactions, mentions, is_edited, created_at`,
+                   attachments, reactions, mentions, is_edited, pinned_at, forwarded, deleted_at, created_at`,
       [
         conversationId,
         actor.organizationId,
@@ -1170,6 +1234,9 @@ export async function sendMessage(
     isMine: true,
     // Freshly inserted: nobody else can have a watermark past `created_at` yet.
     status: 'sent',
+    pinnedAt: null,
+    isForwarded: false,
+    isDeleted: false,
     createdAt: new Date(row.created_at).toISOString(),
   };
 }
@@ -1240,7 +1307,7 @@ async function sendAttachmentMessage(
       `INSERT INTO messages (id, conversation_id, organization_id, sender_id, body, attachments)
             VALUES ($1, $2, $3, $4, '', $5::jsonb)
          RETURNING id, conversation_id, sender_id, body, thread_parent_id, reply_to_id,
-                   attachments, reactions, mentions, is_edited, created_at`,
+                   attachments, reactions, mentions, is_edited, pinned_at, forwarded, deleted_at, created_at`,
       [messageId, conversationId, actor.organizationId, actor.userId, JSON.stringify([attachment])],
     );
 
@@ -1290,6 +1357,9 @@ async function sendAttachmentMessage(
     isEdited: row.is_edited,
     isMine: true,
     status: 'sent',
+    pinnedAt: null,
+    isForwarded: false,
+    isDeleted: false,
     createdAt: new Date(row.created_at).toISOString(),
   };
 }
@@ -1342,14 +1412,281 @@ export async function markConversationRead(actor: Actor, conversationId: string)
   );
 }
 
-export async function deleteMessage(actor: Actor, messageId: string): Promise<void> {
+export type DeleteMessageMode = 'me' | 'everyone';
+
+/**
+ * Deletes a message, WhatsApp-style, in one of two ways:
+ *
+ * - `'me'`: hides the message from the caller only. Any participant can do
+ *   this to any message, including ones they didn't send — it never touches
+ *   the row anyone else sees, it just adds the caller to `deleted_for`, which
+ *   every listing query (`listMessages`, `listMedia`, `listLinks`,
+ *   `listPinnedMessages`) excludes on their behalf.
+ * - `'everyone'`: only the sender can do this. The message becomes a
+ *   tombstone — `body` and `attachments` are cleared and `reactions` reset,
+ *   so nothing it carried survives — but the row itself stays in the thread
+ *   with `deleted_at` set, and every participant (including the sender)
+ *   keeps seeing it, now rendered as "This message was deleted".
+ *
+ * Returns the hydrated message for `'everyone'`, so the caller's own client
+ * can swap the tombstone in immediately instead of waiting for the next
+ * poll; returns null for `'me'`, since that view only makes sense for other
+ * participants, who did not just delete anything.
+ */
+export async function deleteMessage(
+  actor: Actor,
+  messageId: string,
+  mode: DeleteMessageMode,
+): Promise<MessageView | null> {
   await requireMembership(actor.userId, actor.organizationId);
+
+  if (mode === 'me') {
+    const message = await queryOne<{ conversation_id: string }>(`SELECT conversation_id FROM messages WHERE id = $1`, [
+      messageId,
+    ]);
+    if (!message) throw AppError.notFound('Message not found');
+    await assertParticipant(message.conversation_id, actor.userId);
+
+    await query(
+      `UPDATE messages SET deleted_for = array_append(deleted_for, $2)
+        WHERE id = $1 AND NOT ($2 = ANY(deleted_for))`,
+      [messageId, actor.userId],
+    );
+    return null;
+  }
+
   const result = await query(
-    `UPDATE messages SET deleted_at = now()
+    `UPDATE messages
+        SET deleted_at = now(), body = '', attachments = '[]'::jsonb, reactions = '{}'::jsonb, pinned_at = NULL
       WHERE id = $1 AND sender_id = $2 AND deleted_at IS NULL`,
     [messageId, actor.userId],
   );
   if (result.rowCount === 0) {
-    throw AppError.notFound('Message not found, or it is not yours to delete');
+    throw AppError.notFound('Message not found, or it is not yours to delete for everyone');
   }
+  return getMessageView(actor, messageId);
+}
+
+/**
+ * Toggles the caller's reaction on a message to one emoji, WhatsApp-style: a
+ * user has at most one reaction per message, so setting a new one replaces
+ * whatever they had before, and tapping the same emoji again clears it. The
+ * row is locked for the read-modify-write so two rapid taps from the same
+ * user can't race each other into an inconsistent `reactions` map.
+ */
+export async function toggleMessageReaction(actor: Actor, messageId: string, emoji: string): Promise<MessageView> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const trimmedEmoji = emoji.trim();
+  if (!trimmedEmoji) throw AppError.validation('Pick an emoji to react with');
+  if (trimmedEmoji.length > 16) throw AppError.validation('That is not a single emoji');
+
+  await withTransaction(async (tx) => {
+    const existing = await tx.query<{ conversation_id: string; reactions: Record<string, string[]>; deleted_at: string | null }>(
+      `SELECT conversation_id, reactions, deleted_at FROM messages WHERE id = $1 FOR UPDATE`,
+      [messageId],
+    );
+    const row = existing.rows[0];
+    if (!row || row.deleted_at) throw AppError.notFound('Message not found');
+    await assertParticipant(row.conversation_id, actor.userId);
+
+    const alreadyHadThis = (row.reactions?.[trimmedEmoji] ?? []).includes(actor.userId);
+
+    const reactions: Record<string, string[]> = {};
+    for (const [emojiKey, userIds] of Object.entries(row.reactions ?? {})) {
+      const withoutActor = userIds.filter((id) => id !== actor.userId);
+      if (withoutActor.length > 0) reactions[emojiKey] = withoutActor;
+    }
+    if (!alreadyHadThis) {
+      reactions[trimmedEmoji] = [...(reactions[trimmedEmoji] ?? []), actor.userId];
+    }
+
+    await tx.query(`UPDATE messages SET reactions = $2::jsonb WHERE id = $1`, [messageId, JSON.stringify(reactions)]);
+  });
+
+  return getMessageView(actor, messageId);
+}
+
+/**
+ * Pins or unpins a message within its conversation. Any participant can pin —
+ * unlike the group-editing actions gated to admins (`assertGroupAdmin`), a
+ * pin only surfaces something already visible to everyone in the thread, it
+ * does not change the group's identity the way its name or membership does.
+ */
+export async function setMessagePinned(actor: Actor, messageId: string, pinned: boolean): Promise<MessageView> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const message = await queryOne<{ conversation_id: string }>(
+    `SELECT conversation_id FROM messages WHERE id = $1 AND deleted_at IS NULL`,
+    [messageId],
+  );
+  if (!message) throw AppError.notFound('Message not found');
+  await assertParticipant(message.conversation_id, actor.userId);
+
+  await query(`UPDATE messages SET pinned_at = $2 WHERE id = $1`, [messageId, pinned ? new Date() : null]);
+  return getMessageView(actor, messageId);
+}
+
+/** Pinned messages in a conversation, most recently pinned first — the chat header's pin banner. */
+export async function listPinnedMessages(actor: Actor, conversationId: string): Promise<MessageView[]> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertParticipant(conversationId, actor.userId);
+
+  const rows = await queryMany<{ id: string }>(
+    `SELECT m.id
+       FROM messages m
+       JOIN conversation_participants cp
+         ON cp.conversation_id = m.conversation_id AND cp.user_id = $2
+      WHERE m.conversation_id = $1
+        AND m.deleted_at IS NULL
+        AND NOT ($2 = ANY(m.deleted_for))
+        AND m.pinned_at IS NOT NULL
+        AND (cp.history_cleared_at IS NULL OR m.created_at > cp.history_cleared_at)
+      ORDER BY m.pinned_at DESC`,
+    [conversationId, actor.userId],
+  );
+
+  return Promise.all(rows.map((row) => getMessageView(actor, row.id)));
+}
+
+export interface ForwardResult {
+  conversationId: string;
+  message: MessageView;
+}
+
+/**
+ * Forwards a message's content (text and/or attachments) into other
+ * conversations as brand-new messages. Attachments are copied by reference —
+ * the same `storageKey` is reused rather than re-uploading the bytes, since
+ * the underlying object is immutable and every recipient already has
+ * permission to read it once it's attached to a message in their own
+ * conversation. A forwarded message starts fresh: no `replyToId` or
+ * `threadParentId` carries over, since those pointed at context that only
+ * existed in the source conversation.
+ */
+export async function forwardMessage(
+  actor: Actor,
+  messageId: string,
+  targetConversationIds: string[],
+): Promise<ForwardResult[]> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const source = await queryOne<{ conversation_id: string; body: string; attachments: StoredAttachment[] }>(
+    `SELECT conversation_id, body, attachments FROM messages WHERE id = $1 AND deleted_at IS NULL`,
+    [messageId],
+  );
+  if (!source) throw AppError.notFound('Message not found');
+  await assertParticipant(source.conversation_id, actor.userId);
+
+  const targets = Array.from(new Set(targetConversationIds));
+  if (targets.length === 0) throw AppError.validation('Pick at least one conversation to forward to');
+  if (targets.length > 20) throw AppError.validation('You can forward to at most 20 conversations at once');
+
+  const attachments = source.attachments ?? [];
+  const firstAttachment = attachments[0];
+  const preview = firstAttachment
+    ? ATTACHMENT_PREVIEW[firstAttachment.kind](firstAttachment.name).slice(0, 160)
+    : source.body.slice(0, 160);
+
+  const results: ForwardResult[] = [];
+  for (const conversationId of targets) {
+    await assertCanMessage(actor, conversationId);
+
+    const row = await withTransaction(async (tx) => {
+      const inserted = await tx.query<MessageRow>(
+        `INSERT INTO messages (conversation_id, organization_id, sender_id, body, attachments, forwarded)
+              VALUES ($1, $2, $3, $4, $5::jsonb, true)
+           RETURNING id, conversation_id, sender_id, body, thread_parent_id, reply_to_id,
+                     attachments, reactions, mentions, is_edited, pinned_at, forwarded, deleted_at, created_at`,
+        [conversationId, actor.organizationId, actor.userId, source.body, JSON.stringify(attachments)],
+      );
+      const stored = inserted.rows[0];
+      if (!stored) throw AppError.internal('Message could not be forwarded');
+
+      await tx.query(
+        `UPDATE conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
+        [conversationId, preview],
+      );
+      await tx.query(
+        `UPDATE conversation_participants SET last_read_at = now()
+          WHERE conversation_id = $1 AND user_id = $2`,
+        [conversationId, actor.userId],
+      );
+      await tx.query(
+        `UPDATE conversation_participants SET deleted_at = NULL
+          WHERE conversation_id = $1 AND deleted_at IS NOT NULL`,
+        [conversationId],
+      );
+
+      await publishEvent(
+        tx,
+        'chat.message_sent',
+        { organizationId: actor.organizationId, conversationId, messageId: stored.id, senderId: actor.userId },
+        { organizationId: actor.organizationId, actorId: actor.userId },
+      );
+
+      return stored;
+    });
+
+    results.push({ conversationId, message: await getMessageView(actor, row.id) });
+  }
+
+  return results;
+}
+
+export interface LinkItemView {
+  id: string;
+  messageId: string;
+  conversationId: string;
+  isMine: boolean;
+  createdAt: string;
+  url: string;
+  domain: string;
+  snippet: string;
+}
+
+const URL_PATTERN = /https?:\/\/[^\s]+/gi;
+
+/** Links shared in a conversation, newest first — the panel's Links tab, alongside Media and Docs. */
+export async function listLinks(actor: Actor, conversationId: string): Promise<LinkItemView[]> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertParticipant(conversationId, actor.userId);
+
+  const rows = await queryMany<{ id: string; sender_id: string | null; body: string; created_at: string }>(
+    `SELECT m.id, m.sender_id, m.body, m.created_at
+       FROM messages m
+       JOIN conversation_participants cp
+         ON cp.conversation_id = m.conversation_id AND cp.user_id = $2
+      WHERE m.conversation_id = $1
+        AND m.deleted_at IS NULL
+        AND NOT ($2 = ANY(m.deleted_for))
+        AND m.body ~* 'https?://'
+        AND (cp.history_cleared_at IS NULL OR m.created_at > cp.history_cleared_at)
+      ORDER BY m.created_at DESC`,
+    [conversationId, actor.userId],
+  );
+
+  const items: LinkItemView[] = [];
+  for (const row of rows) {
+    const matches = row.body.match(URL_PATTERN) ?? [];
+    for (const url of matches) {
+      let domain = url;
+      try {
+        domain = new URL(url).hostname;
+      } catch {
+        // Not a parseable URL despite matching the pattern; fall back to showing it as-is.
+      }
+      items.push({
+        id: `${row.id}:${items.length}`,
+        messageId: row.id,
+        conversationId,
+        isMine: row.sender_id === actor.userId,
+        createdAt: new Date(row.created_at).toISOString(),
+        url,
+        domain,
+        snippet: row.body.slice(0, 200),
+      });
+    }
+  }
+  return items;
 }

@@ -300,6 +300,22 @@ messagingRoutes.get(
   }),
 );
 
+messagingRoutes.get(
+  '/conversations/:conversationId/links',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    res.json({ links: await service.listLinks(actorOf(req), conversationId) });
+  }),
+);
+
+messagingRoutes.get(
+  '/conversations/:conversationId/pinned',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    res.json({ messages: await service.listPinnedMessages(actorOf(req), conversationId) });
+  }),
+);
+
 messagingRoutes.delete(
   '/conversations/:conversationId',
   asyncHandler(async (req: Request, res: Response) => {
@@ -313,7 +329,49 @@ messagingRoutes.delete(
   '/messages/:messageId',
   asyncHandler(async (req: Request, res: Response) => {
     const { messageId } = parseParams(messageParams, req);
-    await service.deleteMessage(actorOf(req), messageId);
-    res.json({ message: 'Message deleted' });
+    const { mode } = parseQuery(z.object({ mode: z.enum(['me', 'everyone']).default('everyone') }), req);
+    const data = await service.deleteMessage(actorOf(req), messageId, mode);
+    res.json({ message: mode === 'everyone' ? 'Message deleted for everyone' : 'Message deleted for you', data });
+  }),
+);
+
+messagingRoutes.post(
+  '/messages/:messageId/react',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { messageId } = parseParams(messageParams, req);
+    const { emoji } = parseBody(z.object({ emoji: z.string().trim().min(1).max(16) }), req);
+    const data = await service.toggleMessageReaction(actorOf(req), messageId, emoji);
+    res.json({ message: 'Reaction updated', data });
+  }),
+);
+
+messagingRoutes.post(
+  '/messages/:messageId/pin',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { messageId } = parseParams(messageParams, req);
+    const data = await service.setMessagePinned(actorOf(req), messageId, true);
+    res.json({ message: 'Message pinned', data });
+  }),
+);
+
+messagingRoutes.post(
+  '/messages/:messageId/unpin',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { messageId } = parseParams(messageParams, req);
+    const data = await service.setMessagePinned(actorOf(req), messageId, false);
+    res.json({ message: 'Message unpinned', data });
+  }),
+);
+
+messagingRoutes.post(
+  '/messages/:messageId/forward',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { messageId } = parseParams(messageParams, req);
+    const { conversationIds } = parseBody(
+      z.object({ conversationIds: z.array(z.string().uuid()).min(1).max(20) }),
+      req,
+    );
+    const results = await service.forwardMessage(actorOf(req), messageId, conversationIds);
+    res.status(201).json({ message: 'Message forwarded', results });
   }),
 );
