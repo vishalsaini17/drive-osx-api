@@ -44,6 +44,12 @@ export interface DomainEventMap {
     messageId: string;
     senderId: string;
   };
+  'chat.group_created': {
+    organizationId: string;
+    conversationId: string;
+    createdBy: string;
+    memberIds: string[];
+  };
 }
 
 export type DomainEventName = keyof DomainEventMap;

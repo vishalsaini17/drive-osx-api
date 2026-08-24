@@ -6,6 +6,7 @@ import { query, queryMany, queryOne, withTransaction } from '../../infrastructur
 import { effectivePresence, isBlockedBetween } from '../contacts/contacts.service.js';
 import { objectKeys } from '../../infrastructure/storage/object-storage.js';
 import { objectStorage } from '../../infrastructure/storage/s3-object-storage.js';
+import { recordAuditDetached } from '../audit/audit.service.js';
 
 /**
  * Direct messaging.
@@ -43,17 +44,26 @@ export interface ChatRequestView {
   counterpart: UserSummary;
 }
 
+/** A conversation participant, plus their role — only meaningful in group conversations (see the group info panel's admin badge). */
+export interface ConversationParticipantView extends UserSummary {
+  role: 'owner' | 'admin' | 'member';
+}
+
 export interface ConversationView {
   id: string;
   kind: 'direct' | 'group';
   title: string;
   topic: string | null;
+  /** A group's avatar — an emoji shorthand or an `http…` URL, same convention as `UserSummary.avatarUrl`. Null for direct chats. */
+  avatarUrl: string | null;
   lastMessageAt: string | null;
   lastMessagePreview: string;
   unreadCount: number;
   isMuted: boolean;
   isPinned: boolean;
-  participants: UserSummary[];
+  /** Per-viewer, independent of any contact record — the only kind of "favourite" a group can have. */
+  isFavourite: boolean;
+  participants: ConversationParticipantView[];
 }
 
 /**
@@ -63,7 +73,7 @@ export interface ConversationView {
  */
 export interface MessageAttachmentView {
   id: string;
-  kind: 'voice' | 'file' | 'image';
+  kind: 'voice' | 'file' | 'image' | 'video';
   name: string;
   mimeType: string;
   size: number;
@@ -74,7 +84,7 @@ export interface MessageAttachmentView {
 /** An attachment as it is stored in `messages.attachments` (jsonb). */
 interface StoredAttachment {
   id: string;
-  kind: 'voice' | 'file' | 'image';
+  kind: 'voice' | 'file' | 'image' | 'video';
   name: string;
   mimeType: string;
   size: number;
@@ -141,6 +151,10 @@ function mapUser(row: Record<string, any>): UserSummary {
     statusEmoji: row.status_emoji ?? '',
     lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
   };
+}
+
+function mapParticipant(row: Record<string, any>): ConversationParticipantView {
+  return { ...mapUser(row), role: row.role };
 }
 
 // ---------------------------------------------------------------------------
@@ -485,8 +499,8 @@ export async function listConversations(actor: Actor): Promise<ConversationView[
   await requireMembership(actor.userId, actor.organizationId);
 
   const rows = await queryMany(
-    `SELECT c.id, c.kind, c.title, c.topic, c.last_message_at, c.last_message_preview,
-            cp.is_muted, cp.is_pinned, cp.last_read_at,
+    `SELECT c.id, c.kind, c.title, c.topic, c.avatar_url, c.last_message_at, c.last_message_preview,
+            cp.is_muted, cp.is_pinned, cp.is_favourite, cp.last_read_at,
             (SELECT count(*) FROM messages m
               WHERE m.conversation_id = c.id
                 AND m.deleted_at IS NULL
@@ -503,18 +517,21 @@ export async function listConversations(actor: Actor): Promise<ConversationView[
   if (rows.length === 0) return [];
 
   const participants = await queryMany(
-    `SELECT cp.conversation_id, ${USER_COLUMNS}
+    `SELECT cp.conversation_id, cp.role, ${USER_COLUMNS}
        FROM conversation_participants cp
        JOIN users u ON u.id = cp.user_id
        LEFT JOIN user_presence p ON p.user_id = u.id
-      WHERE cp.conversation_id = ANY($1::uuid[])`,
+      WHERE cp.conversation_id = ANY($1::uuid[])
+      -- Owner (and any admin) first, then by how long they've been a
+      -- member — the order the group info panel's member list uses.
+      ORDER BY (cp.role = 'owner') DESC, (cp.role = 'admin') DESC, cp.joined_at`,
     [rows.map((row) => row.id)],
   );
 
-  const byConversation = new Map<string, UserSummary[]>();
+  const byConversation = new Map<string, ConversationParticipantView[]>();
   for (const row of participants) {
     const list = byConversation.get(row.conversation_id) ?? [];
-    list.push(mapUser(row));
+    list.push(mapParticipant(row));
     byConversation.set(row.conversation_id, list);
   }
 
@@ -527,13 +544,256 @@ export async function listConversations(actor: Actor): Promise<ConversationView[
       // A direct conversation is named after the other person.
       title: row.title ?? (others[0]?.fullName || 'Conversation'),
       topic: row.topic ?? null,
+      avatarUrl: row.avatar_url ?? null,
       lastMessageAt: row.last_message_at ? new Date(row.last_message_at).toISOString() : null,
       lastMessagePreview: row.last_message_preview ?? '',
       unreadCount: Number(row.unread_count ?? 0),
       isMuted: row.is_muted,
+      isFavourite: row.is_favourite,
       isPinned: row.is_pinned,
       participants: members,
     };
+  });
+}
+
+export interface CreateGroupInput {
+  title: string;
+  /** Does not need to (and should not) include the creator. */
+  memberUserIds: string[];
+}
+
+/**
+ * Starts a group conversation. Membership is restricted to the caller's own
+ * contacts, the same boundary direct messaging already has: without it, a
+ * group would be a way to message a stranger you could not otherwise reach,
+ * bypassing the chat-request flow entirely.
+ */
+export async function createGroupConversation(actor: Actor, input: CreateGroupInput): Promise<ConversationView> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const title = input.title.trim();
+  if (!title) throw AppError.validation('A group needs a name');
+
+  const memberIds = Array.from(new Set(input.memberUserIds)).filter((id) => id !== actor.userId);
+  if (memberIds.length < 2) throw AppError.validation('Pick at least 2 people to start a group');
+
+  const contactRows = await queryMany<{ contact_user_id: string }>(
+    `SELECT contact_user_id FROM contacts WHERE owner_id = $1 AND contact_user_id = ANY($2::uuid[])`,
+    [actor.userId, memberIds],
+  );
+  if (contactRows.length !== memberIds.length) {
+    throw AppError.validation('You can only add people from your contacts to a group');
+  }
+
+  const conversationId = await withTransaction(async (tx) => {
+    const conversation = await tx.query<{ id: string }>(
+      `INSERT INTO conversations (organization_id, kind, title, created_by) VALUES ($1, 'group', $2, $3) RETURNING id`,
+      [actor.organizationId, title, actor.userId],
+    );
+    const id = conversation.rows[0]?.id;
+    if (!id) throw AppError.internal('Group could not be created');
+
+    await tx.query(
+      `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'owner')`,
+      [id, actor.userId],
+    );
+    for (const memberId of memberIds) {
+      await tx.query(
+        `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`,
+        [id, memberId],
+      );
+    }
+
+    await publishEvent(
+      tx,
+      'chat.group_created',
+      { organizationId: actor.organizationId, conversationId: id, createdBy: actor.userId, memberIds },
+      { organizationId: actor.organizationId, actorId: actor.userId },
+    );
+
+    return id;
+  });
+
+  const conversations = await listConversations(actor);
+  const created = conversations.find((conversation) => conversation.id === conversationId);
+  if (!created) throw AppError.internal('Group could not be created');
+  return created;
+}
+
+async function assertGroup(conversationId: string): Promise<void> {
+  const conversation = await queryOne<{ kind: string }>(`SELECT kind FROM conversations WHERE id = $1`, [
+    conversationId,
+  ]);
+  if (!conversation) throw AppError.notFound('Conversation not found');
+  if (conversation.kind !== 'group') throw AppError.validation('This is not a group conversation');
+}
+
+/** Renaming, re-describing, re-picturing, and adding members are admin-only — everyone can still view and message. */
+async function assertGroupAdmin(conversationId: string, userId: string): Promise<void> {
+  const participant = await queryOne<{ role: string }>(
+    `SELECT role FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, userId],
+  );
+  if (!participant || (participant.role !== 'owner' && participant.role !== 'admin')) {
+    throw AppError.permission('Only a group admin can do that');
+  }
+}
+
+/**
+ * Adds a member to a group. Restricted to admins, and to the caller's own
+ * contacts — the same boundary `createGroupConversation` has — otherwise a
+ * group would be a side door for messaging someone you could not otherwise
+ * reach.
+ */
+export async function addGroupMember(actor: Actor, conversationId: string, newMemberId: string): Promise<ConversationView> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertGroup(conversationId);
+  await assertGroupAdmin(conversationId, actor.userId);
+
+  if (newMemberId === actor.userId) throw AppError.validation('You are already in this group');
+
+  const contact = await queryOne(
+    `SELECT 1 FROM contacts WHERE owner_id = $1 AND contact_user_id = $2`,
+    [actor.userId, newMemberId],
+  );
+  if (!contact) throw AppError.validation('You can only add people from your contacts to a group');
+
+  const already = await queryOne(
+    `SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, newMemberId],
+  );
+  if (already) throw AppError.conflict('That person is already in the group');
+
+  await query(
+    `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`,
+    [conversationId, newMemberId],
+  );
+
+  const conversations = await listConversations(actor);
+  const updated = conversations.find((conversation) => conversation.id === conversationId);
+  if (!updated) throw AppError.internal('Group could not be updated');
+  return updated;
+}
+
+/**
+ * Leaving a group deletes the participant row outright — unlike
+ * `deleteConversation`, there is no reviving it later; someone still in the
+ * group has to add you back. If the owner leaves and others remain,
+ * ownership passes to the longest-standing admin, or failing that the
+ * longest-standing member, so the group is never left without one.
+ */
+export async function leaveGroupConversation(actor: Actor, conversationId: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertParticipant(conversationId, actor.userId);
+  await assertGroup(conversationId);
+
+  await withTransaction(async (tx) => {
+    const self = await tx.query<{ role: string }>(
+      `SELECT role FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`,
+      [conversationId, actor.userId],
+    );
+
+    await tx.query(`DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`, [
+      conversationId,
+      actor.userId,
+    ]);
+
+    if (self.rows[0]?.role === 'owner') {
+      const successor = await tx.query<{ user_id: string }>(
+        `SELECT user_id FROM conversation_participants
+          WHERE conversation_id = $1
+          ORDER BY (role = 'admin') DESC, joined_at
+          LIMIT 1`,
+        [conversationId],
+      );
+      const successorId = successor.rows[0]?.user_id;
+      if (successorId) {
+        await tx.query(`UPDATE conversation_participants SET role = 'owner' WHERE conversation_id = $1 AND user_id = $2`, [
+          conversationId,
+          successorId,
+        ]);
+      }
+    }
+  });
+}
+
+/** A group's description — `conversations.topic`, unused until now. Admin-only. */
+export async function setGroupDescription(actor: Actor, conversationId: string, description: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertGroup(conversationId);
+  await assertGroupAdmin(conversationId, actor.userId);
+
+  await query(`UPDATE conversations SET topic = $2 WHERE id = $1`, [conversationId, description.trim().slice(0, 500)]);
+}
+
+/** A group's name. Admin-only. */
+export async function renameGroup(actor: Actor, conversationId: string, title: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertGroup(conversationId);
+  await assertGroupAdmin(conversationId, actor.userId);
+
+  const trimmed = title.trim();
+  if (!trimmed) throw AppError.validation('A group needs a name');
+
+  await query(`UPDATE conversations SET title = $2 WHERE id = $1`, [conversationId, trimmed.slice(0, 120)]);
+}
+
+/**
+ * A group's avatar — same convention as `users.avatar_url` (identity module):
+ * an emoji shorthand or an `http…` image URL, set directly rather than
+ * uploaded. Admin-only.
+ */
+export async function setGroupAvatar(actor: Actor, conversationId: string, avatarUrl: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertGroup(conversationId);
+  await assertGroupAdmin(conversationId, actor.userId);
+
+  const trimmed = avatarUrl.trim();
+  if (trimmed.length > 500) throw AppError.validation('That avatar value is too long');
+
+  await query(`UPDATE conversations SET avatar_url = $2 WHERE id = $1`, [conversationId, trimmed || null]);
+}
+
+/**
+ * Favouriting is per-viewer and per-conversation, independent of any contact
+ * record — the only kind of "favourite" a group can have, since it has no
+ * single contact behind it the way a direct chat's peer does.
+ */
+export async function setConversationFavourite(
+  actor: Actor,
+  conversationId: string,
+  isFavourite: boolean,
+): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  const result = await query(
+    `UPDATE conversation_participants SET is_favourite = $3 WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, actor.userId, isFavourite],
+  );
+  if (result.rowCount === 0) throw AppError.notFound('Conversation not found');
+}
+
+/**
+ * Records a report against a group by writing an audit entry rather than a
+ * bespoke table — this is exactly the "who did what to which resource" shape
+ * audit logs already exist for (CLAUDE.md §28), and it gives an organisation
+ * admin a real trail to review without inventing a parallel moderation
+ * queue this project has no UI for yet.
+ */
+export async function reportGroup(actor: Actor, conversationId: string, reason: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertParticipant(conversationId, actor.userId);
+  await assertGroup(conversationId);
+
+  const trimmedReason = reason.trim();
+  if (!trimmedReason) throw AppError.validation('Add a reason for the report');
+
+  recordAuditDetached({
+    organizationId: actor.organizationId,
+    actorId: actor.userId,
+    action: 'group.reported',
+    resourceType: 'conversation',
+    resourceId: conversationId,
+    metadata: { reason: trimmedReason.slice(0, 1000) },
   });
 }
 
@@ -587,13 +847,24 @@ function computeMessageStatus(createdAt: Date, others: ParticipantWatermark[]): 
 
 /**
  * Every precondition for putting new content into a conversation: the caller
- * is a member and a participant, and nobody on either side has blocked the
- * other. Shared by `sendMessage` and `sendVoiceMessage` so the two can never
- * drift apart on what "allowed to message" means.
+ * is a member and a participant, and — for a direct conversation — nobody on
+ * either side has blocked the other. Shared by `sendMessage` and every
+ * attachment sender so they can never drift apart on what "allowed to
+ * message" means.
+ *
+ * Blocking is a 1:1 concept and stays that way here: enforcing it pairwise
+ * in a group would let any single blocked relationship between two members
+ * silently stop the whole conversation for everyone, which is not what
+ * either of them asked for.
  */
 async function assertCanMessage(actor: Actor, conversationId: string): Promise<void> {
   await requireMembership(actor.userId, actor.organizationId);
   await assertParticipant(conversationId, actor.userId);
+
+  const conversation = await queryOne<{ kind: string }>(`SELECT kind FROM conversations WHERE id = $1`, [
+    conversationId,
+  ]);
+  if (conversation?.kind === 'group') return;
 
   const others = await otherParticipantIds(conversationId, actor.userId);
   for (const otherId of others) {
@@ -903,31 +1174,42 @@ export async function sendMessage(
   };
 }
 
-const MAX_VOICE_MESSAGE_BYTES = 10 * 1024 * 1024; // generous for a compressed voice note
+// Generous for chat images/short clips/documents without turning Messenger
+// into a general file-transfer tool — that is Drive's job (CLAUDE.md §11).
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
-export interface VoiceMessageInput {
+interface NewAttachmentInput {
   buffer: Buffer;
   mimeType: string;
   size: number;
+  name: string;
+  kind: 'voice' | 'image' | 'video' | 'file';
   durationSeconds?: number;
 }
 
+const ATTACHMENT_PREVIEW: Record<NewAttachmentInput['kind'], (name: string) => string> = {
+  voice: () => '🎤 Voice message',
+  image: () => '📷 Photo',
+  video: () => '🎥 Video',
+  file: (name) => `📎 ${name}`,
+};
+
 /**
- * A voice message is a normal message whose only content is one audio
- * attachment: bytes go to object storage first (CLAUDE.md §11), and the
- * message body stays empty — the conversation preview and search have
- * nothing text-shaped to show for it either way.
+ * The shared core behind every attachment-only message (voice notes,
+ * documents, photos, videos): bytes go to object storage first (CLAUDE.md
+ * §11), the message body stays empty, and the conversation preview gets a
+ * kind-appropriate label since there is no text to show instead.
  */
-export async function sendVoiceMessage(
+async function sendAttachmentMessage(
   actor: Actor,
   conversationId: string,
-  input: VoiceMessageInput,
+  input: NewAttachmentInput,
 ): Promise<MessageView> {
   await assertCanMessage(actor, conversationId);
 
-  if (input.size === 0) throw AppError.validation('The recording was empty');
-  if (input.size > MAX_VOICE_MESSAGE_BYTES) {
-    throw AppError.validation('Voice messages are limited to 10 MB');
+  if (input.size === 0) throw AppError.validation('The file was empty');
+  if (input.size > MAX_ATTACHMENT_BYTES) {
+    throw AppError.validation('Attachments are limited to 25 MB');
   }
 
   const messageId = randomUUID();
@@ -943,13 +1225,15 @@ export async function sendVoiceMessage(
 
   const attachment: StoredAttachment = {
     id: messageId,
-    kind: 'voice',
-    name: 'Voice message',
+    kind: input.kind,
+    name: input.name,
     mimeType: input.mimeType,
     size: input.size,
     storageKey,
     ...(input.durationSeconds ? { durationSeconds: input.durationSeconds } : {}),
   };
+
+  const preview = ATTACHMENT_PREVIEW[input.kind](input.name).slice(0, 160);
 
   const row = await withTransaction(async (tx) => {
     const inserted = await tx.query<MessageRow>(
@@ -961,11 +1245,11 @@ export async function sendVoiceMessage(
     );
 
     const stored = inserted.rows[0];
-    if (!stored) throw AppError.internal('Voice message could not be stored');
+    if (!stored) throw AppError.internal('Message could not be stored');
 
     await tx.query(
       `UPDATE conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
-      [conversationId, '🎤 Voice message'],
+      [conversationId, preview],
     );
     await tx.query(
       `UPDATE conversation_participants SET last_read_at = now()
@@ -1008,6 +1292,42 @@ export async function sendVoiceMessage(
     status: 'sent',
     createdAt: new Date(row.created_at).toISOString(),
   };
+}
+
+export interface VoiceMessageInput {
+  buffer: Buffer;
+  mimeType: string;
+  size: number;
+  durationSeconds?: number;
+}
+
+export async function sendVoiceMessage(
+  actor: Actor,
+  conversationId: string,
+  input: VoiceMessageInput,
+): Promise<MessageView> {
+  return sendAttachmentMessage(actor, conversationId, { ...input, name: 'Voice message', kind: 'voice' });
+}
+
+export interface FileMessageInput {
+  buffer: Buffer;
+  mimeType: string;
+  size: number;
+  name: string;
+}
+
+/** Document, photo, video, or audio-file share — the "+" menu next to the composer. */
+export async function sendFileMessage(
+  actor: Actor,
+  conversationId: string,
+  input: FileMessageInput,
+): Promise<MessageView> {
+  const kind: NewAttachmentInput['kind'] = input.mimeType.startsWith('image/')
+    ? 'image'
+    : input.mimeType.startsWith('video/')
+    ? 'video'
+    : 'file';
+  return sendAttachmentMessage(actor, conversationId, { ...input, kind });
 }
 
 export async function markConversationRead(actor: Actor, conversationId: string): Promise<void> {

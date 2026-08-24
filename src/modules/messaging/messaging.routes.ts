@@ -12,12 +12,12 @@ export const messagingRoutes = Router();
 
 messagingRoutes.use(authenticate());
 
-// Buffered in memory, then streamed to object storage. 10 MB comfortably
-// covers a compressed voice note; the service enforces the same limit so an
-// oversized body is rejected even if this changes later.
-const uploadVoiceMessage = multer({
+// Buffered in memory, then streamed to object storage. 25 MB matches the
+// service's own attachment limit, so an oversized body is rejected here (no
+// wasted upload) as well as there (defense in depth).
+const uploadAttachment = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
 });
 
 function actorOf(req: Request): service.Actor {
@@ -95,6 +95,21 @@ messagingRoutes.get(
   }),
 );
 
+messagingRoutes.post(
+  '/groups',
+  asyncHandler(async (req: Request, res: Response) => {
+    const body = parseBody(
+      z.object({
+        title: z.string().trim().min(1, 'A group needs a name').max(120),
+        memberUserIds: z.array(z.string().uuid()).min(2, 'Pick at least 2 people to start a group').max(200),
+      }),
+      req,
+    );
+    const conversation = await service.createGroupConversation(actorOf(req), body);
+    res.status(201).json({ message: 'Group created', conversation });
+  }),
+);
+
 // Declared before /conversations/:conversationId/... so "with" is never
 // mistaken for a conversation id.
 messagingRoutes.get(
@@ -142,7 +157,7 @@ messagingRoutes.post(
 messagingRoutes.post(
   '/conversations/:conversationId/voice-message',
   rateLimit({ bucket: 'upload', windowSeconds: 60, max: 120 }),
-  uploadVoiceMessage.single('audio'),
+  uploadAttachment.single('audio'),
   asyncHandler(async (req: Request, res: Response) => {
     const { conversationId } = parseParams(conversationParams, req);
     const uploaded = req.file;
@@ -164,11 +179,107 @@ messagingRoutes.post(
 );
 
 messagingRoutes.post(
+  '/conversations/:conversationId/attachment',
+  rateLimit({ bucket: 'upload', windowSeconds: 60, max: 120 }),
+  uploadAttachment.single('file'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const uploaded = req.file;
+    if (!uploaded) throw AppError.validation('No file was included in the upload');
+
+    const message = await service.sendFileMessage(actorOf(req), conversationId, {
+      buffer: uploaded.buffer,
+      mimeType: uploaded.mimetype || 'application/octet-stream',
+      size: uploaded.size,
+      name: uploaded.originalname || 'Attachment',
+    });
+    res.status(201).json({ message: 'File sent', data: message });
+  }),
+);
+
+messagingRoutes.post(
   '/conversations/:conversationId/clear',
   asyncHandler(async (req: Request, res: Response) => {
     const { conversationId } = parseParams(conversationParams, req);
     await service.clearConversationHistory(actorOf(req), conversationId);
     res.json({ message: 'Chat cleared' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/favourite',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    await service.setConversationFavourite(actorOf(req), conversationId, true);
+    res.json({ message: 'Added to favourites' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/unfavourite',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    await service.setConversationFavourite(actorOf(req), conversationId, false);
+    res.json({ message: 'Removed from favourites' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/description',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const { description } = parseBody(z.object({ description: z.string().trim().max(500) }), req);
+    await service.setGroupDescription(actorOf(req), conversationId, description);
+    res.json({ message: 'Description updated' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/rename',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const { title } = parseBody(z.object({ title: z.string().trim().min(1, 'A group needs a name').max(120) }), req);
+    await service.renameGroup(actorOf(req), conversationId, title);
+    res.json({ message: 'Group renamed' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/avatar',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const { avatarUrl } = parseBody(z.object({ avatarUrl: z.string().trim().max(500) }), req);
+    await service.setGroupAvatar(actorOf(req), conversationId, avatarUrl);
+    res.json({ message: 'Avatar updated' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/members',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const { userId } = parseBody(z.object({ userId: z.string().uuid('Invalid user id') }), req);
+    const conversation = await service.addGroupMember(actorOf(req), conversationId, userId);
+    res.status(201).json({ message: 'Member added', conversation });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/leave',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    await service.leaveGroupConversation(actorOf(req), conversationId);
+    res.json({ message: 'Left the group' });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/report',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const { reason } = parseBody(z.object({ reason: z.string().trim().min(1, 'Add a reason').max(1000) }), req);
+    await service.reportGroup(actorOf(req), conversationId, reason);
+    res.json({ message: 'Report submitted' });
   }),
 );
 
