@@ -47,4 +47,6 @@ export const objectKeys = {
   attachment: (organizationId: string, emailId: string, attachmentId: string) =>
     `attachments/${organizationId}/${emailId}/${attachmentId}`,
   upload: (organizationId: string, uploadId: string) => `uploads/${organizationId}/${uploadId}`,
+  chatAttachment: (organizationId: string, conversationId: string, messageId: string) =>
+    `chat-attachments/${organizationId}/${conversationId}/${messageId}`,
 };

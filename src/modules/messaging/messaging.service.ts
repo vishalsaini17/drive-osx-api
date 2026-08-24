@@ -1,8 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { AppError } from '../../platform/errors/app-error.js';
 import { publishEvent } from '../../platform/events/event-bus.js';
 import { requireMembership } from '../../platform/authorization/access-control.js';
 import { query, queryMany, queryOne, withTransaction } from '../../infrastructure/database/pool.js';
 import { effectivePresence, isBlockedBetween } from '../contacts/contacts.service.js';
+import { objectKeys } from '../../infrastructure/storage/object-storage.js';
+import { objectStorage } from '../../infrastructure/storage/s3-object-storage.js';
 
 /**
  * Direct messaging.
@@ -53,6 +56,35 @@ export interface ConversationView {
   participants: UserSummary[];
 }
 
+/**
+ * An attachment as the API returns it. Stored (see `StoredAttachment` below)
+ * with an object-storage key rather than a URL — a bucket is private, so a
+ * usable link has to be minted fresh, with a short expiry, at read time.
+ */
+export interface MessageAttachmentView {
+  id: string;
+  kind: 'voice' | 'file' | 'image';
+  name: string;
+  mimeType: string;
+  size: number;
+  url: string;
+  durationSeconds?: number;
+}
+
+/** An attachment as it is stored in `messages.attachments` (jsonb). */
+interface StoredAttachment {
+  id: string;
+  kind: 'voice' | 'file' | 'image';
+  name: string;
+  mimeType: string;
+  size: number;
+  storageKey: string;
+  durationSeconds?: number;
+}
+
+/** Only meaningful for a message the caller sent — nobody sees ticks on a message they received. */
+export type MessageDeliveryStatus = 'sent' | 'delivered' | 'read';
+
 export interface MessageView {
   id: string;
   conversationId: string;
@@ -61,11 +93,13 @@ export interface MessageView {
   body: string;
   threadParentId: string | null;
   replyToId: string | null;
-  attachments: unknown[];
+  attachments: MessageAttachmentView[];
   reactions: Record<string, string[]>;
   mentions: string[];
   isEdited: boolean;
   isMine: boolean;
+  /** Present only when `isMine` — single/double/blue tick. */
+  status?: MessageDeliveryStatus;
   createdAt: string;
 }
 
@@ -76,7 +110,7 @@ interface MessageRow {
   body: string;
   thread_parent_id: string | null;
   reply_to_id: string | null;
-  attachments: unknown[];
+  attachments: StoredAttachment[];
   reactions: Record<string, string[]>;
   mentions: string[];
   is_edited: boolean;
@@ -522,6 +556,74 @@ async function otherParticipantIds(conversationId: string, userId: string): Prom
   return rows.map((row) => row.user_id);
 }
 
+interface ParticipantWatermark {
+  last_read_at: Date | null;
+  last_delivered_at: Date | null;
+}
+
+/** The other participants' read/delivery watermarks — what a sent message's status is judged against. */
+async function otherParticipantWatermarks(conversationId: string, userId: string): Promise<ParticipantWatermark[]> {
+  return queryMany<ParticipantWatermark>(
+    `SELECT last_read_at, last_delivered_at
+       FROM conversation_participants
+      WHERE conversation_id = $1 AND user_id <> $2`,
+    [conversationId, userId],
+  );
+}
+
+/**
+ * A message is "read" once every other participant's `last_read_at` has
+ * caught up to it, "delivered" once at least one has — matching a group
+ * chat's usual all-vs-any tick semantics, though today's UI only ever has one
+ * other participant. No watermark at all (a brand-new participant row) means
+ * "sent" — the message has not been fetched yet.
+ */
+function computeMessageStatus(createdAt: Date, others: ParticipantWatermark[]): MessageDeliveryStatus {
+  if (others.length === 0) return 'sent';
+  if (others.every((other) => other.last_read_at && other.last_read_at >= createdAt)) return 'read';
+  if (others.some((other) => other.last_delivered_at && other.last_delivered_at >= createdAt)) return 'delivered';
+  return 'sent';
+}
+
+/**
+ * Every precondition for putting new content into a conversation: the caller
+ * is a member and a participant, and nobody on either side has blocked the
+ * other. Shared by `sendMessage` and `sendVoiceMessage` so the two can never
+ * drift apart on what "allowed to message" means.
+ */
+async function assertCanMessage(actor: Actor, conversationId: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertParticipant(conversationId, actor.userId);
+
+  const others = await otherParticipantIds(conversationId, actor.userId);
+  for (const otherId of others) {
+    if (await isBlockedBetween(actor.userId, otherId)) {
+      throw AppError.permission('You cannot message this person while blocked');
+    }
+  }
+}
+
+/**
+ * Turns stored attachments (object-storage key only) into API-facing ones
+ * (a usable, time-limited URL). Resolved at read time rather than stored,
+ * because the bucket is private and a stored URL would eventually expire
+ * without anything to refresh it.
+ */
+async function resolveAttachments(stored: StoredAttachment[]): Promise<MessageAttachmentView[]> {
+  if (!stored || stored.length === 0) return [];
+  return Promise.all(
+    stored.map(async (attachment) => ({
+      id: attachment.id,
+      kind: attachment.kind,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      durationSeconds: attachment.durationSeconds,
+      url: await objectStorage.signedDownloadUrl(attachment.storageKey, { expiresInSeconds: 3600 }),
+    })),
+  );
+}
+
 /**
  * Deletes a conversation for the caller only, WhatsApp-style: their row in
  * `conversation_participants` is marked deleted so it drops out of their
@@ -543,6 +645,23 @@ export async function deleteConversation(actor: Actor, conversationId: string): 
   await requireMembership(actor.userId, actor.organizationId);
   const result = await query(
     `UPDATE conversation_participants SET deleted_at = now(), history_cleared_at = now()
+      WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, actor.userId],
+  );
+  if (result.rowCount === 0) throw AppError.notFound('Conversation not found');
+}
+
+/**
+ * Clears the caller's message history without touching the conversation's
+ * place in their list — the "Clear chat" action, as distinct from "Delete
+ * chat" above. Only `history_cleared_at` moves; `deleted_at` is left alone,
+ * so the conversation stays right where it was in the sidebar, just empty
+ * until new messages arrive. The other participant's copy is unaffected.
+ */
+export async function clearConversationHistory(actor: Actor, conversationId: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  const result = await query(
+    `UPDATE conversation_participants SET history_cleared_at = now()
       WHERE conversation_id = $1 AND user_id = $2`,
     [conversationId, actor.userId],
   );
@@ -613,7 +732,7 @@ export async function listMedia(actor: Actor, conversationId: string): Promise<M
 
   const items: MediaItemView[] = [];
   for (const row of rows) {
-    row.attachments.forEach((attachment, index) => {
+    for (const [index, attachment] of row.attachments.entries()) {
       items.push({
         id: `${row.id}:${attachment.id ?? index}`,
         messageId: row.id,
@@ -621,11 +740,13 @@ export async function listMedia(actor: Actor, conversationId: string): Promise<M
         isMine: row.sender_id === actor.userId,
         createdAt: new Date(row.created_at).toISOString(),
         name: attachment.name ?? 'Attachment',
-        url: attachment.url ?? null,
+        url: attachment.storageKey
+          ? await objectStorage.signedDownloadUrl(attachment.storageKey, { expiresInSeconds: 3600 })
+          : attachment.url ?? null,
         mimeType: attachment.mimeType ?? attachment.type ?? null,
         size: typeof attachment.size === 'number' ? attachment.size : null,
       });
-    });
+    }
   }
   return items;
 }
@@ -658,22 +779,37 @@ export async function listMessages(
     [conversationId, options.before ?? null, limit, actor.userId],
   );
 
+  // Fetching the thread is itself a delivery: the caller's client now has
+  // these bytes, whether or not they go on to read them (see 0008).
+  await query(
+    `UPDATE conversation_participants SET last_delivered_at = now()
+      WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, actor.userId],
+  );
+
+  const others = await otherParticipantWatermarks(conversationId, actor.userId);
+
   // Query is newest-first for the limit; the client wants oldest-first.
-  return rows.reverse().map((row) => ({
-    id: row.id,
-    conversationId: row.conversation_id,
-    senderId: row.sender_id,
-    senderName: row.sender_name,
-    body: row.body,
-    threadParentId: row.thread_parent_id,
-    replyToId: row.reply_to_id,
-    attachments: row.attachments ?? [],
-    reactions: row.reactions ?? {},
-    mentions: row.mentions ?? [],
-    isEdited: row.is_edited,
-    isMine: row.sender_id === actor.userId,
-    createdAt: new Date(row.created_at).toISOString(),
-  }));
+  return Promise.all(
+    rows.reverse().map(async (row) => ({
+      id: row.id,
+      conversationId: row.conversation_id,
+      senderId: row.sender_id,
+      senderName: row.sender_name,
+      body: row.body,
+      threadParentId: row.thread_parent_id,
+      replyToId: row.reply_to_id,
+      attachments: await resolveAttachments(row.attachments ?? []),
+      reactions: row.reactions ?? {},
+      mentions: row.mentions ?? [],
+      isEdited: row.is_edited,
+      isMine: row.sender_id === actor.userId,
+      ...(row.sender_id === actor.userId
+        ? { status: computeMessageStatus(new Date(row.created_at), others) }
+        : {}),
+      createdAt: new Date(row.created_at).toISOString(),
+    })),
+  );
 }
 
 export async function sendMessage(
@@ -681,18 +817,10 @@ export async function sendMessage(
   conversationId: string,
   input: { body: string; replyToId?: string; threadParentId?: string; mentions?: string[] },
 ): Promise<MessageView> {
-  await requireMembership(actor.userId, actor.organizationId);
-  await assertParticipant(conversationId, actor.userId);
+  await assertCanMessage(actor, conversationId);
 
   const body = input.body.trim();
   if (!body) throw AppError.validation('A message cannot be empty');
-
-  const others = await otherParticipantIds(conversationId, actor.userId);
-  for (const otherId of others) {
-    if (await isBlockedBetween(actor.userId, otherId)) {
-      throw AppError.permission('You cannot message this person while blocked');
-    }
-  }
 
   const row = await withTransaction(async (tx) => {
     const inserted = await tx.query<MessageRow>(
@@ -764,11 +892,120 @@ export async function sendMessage(
     body: row.body,
     threadParentId: row.thread_parent_id,
     replyToId: row.reply_to_id,
-    attachments: row.attachments ?? [],
+    attachments: await resolveAttachments(row.attachments ?? []),
     reactions: row.reactions ?? {},
     mentions: row.mentions ?? [],
     isEdited: row.is_edited,
     isMine: true,
+    // Freshly inserted: nobody else can have a watermark past `created_at` yet.
+    status: 'sent',
+    createdAt: new Date(row.created_at).toISOString(),
+  };
+}
+
+const MAX_VOICE_MESSAGE_BYTES = 10 * 1024 * 1024; // generous for a compressed voice note
+
+export interface VoiceMessageInput {
+  buffer: Buffer;
+  mimeType: string;
+  size: number;
+  durationSeconds?: number;
+}
+
+/**
+ * A voice message is a normal message whose only content is one audio
+ * attachment: bytes go to object storage first (CLAUDE.md §11), and the
+ * message body stays empty — the conversation preview and search have
+ * nothing text-shaped to show for it either way.
+ */
+export async function sendVoiceMessage(
+  actor: Actor,
+  conversationId: string,
+  input: VoiceMessageInput,
+): Promise<MessageView> {
+  await assertCanMessage(actor, conversationId);
+
+  if (input.size === 0) throw AppError.validation('The recording was empty');
+  if (input.size > MAX_VOICE_MESSAGE_BYTES) {
+    throw AppError.validation('Voice messages are limited to 10 MB');
+  }
+
+  const messageId = randomUUID();
+  const storageKey = objectKeys.chatAttachment(actor.organizationId, conversationId, messageId);
+
+  // Bytes first: a failed write leaves no message pointing at a missing object.
+  await objectStorage.put({
+    key: storageKey,
+    body: input.buffer,
+    contentType: input.mimeType,
+    contentLength: input.size,
+  });
+
+  const attachment: StoredAttachment = {
+    id: messageId,
+    kind: 'voice',
+    name: 'Voice message',
+    mimeType: input.mimeType,
+    size: input.size,
+    storageKey,
+    ...(input.durationSeconds ? { durationSeconds: input.durationSeconds } : {}),
+  };
+
+  const row = await withTransaction(async (tx) => {
+    const inserted = await tx.query<MessageRow>(
+      `INSERT INTO messages (id, conversation_id, organization_id, sender_id, body, attachments)
+            VALUES ($1, $2, $3, $4, '', $5::jsonb)
+         RETURNING id, conversation_id, sender_id, body, thread_parent_id, reply_to_id,
+                   attachments, reactions, mentions, is_edited, created_at`,
+      [messageId, conversationId, actor.organizationId, actor.userId, JSON.stringify([attachment])],
+    );
+
+    const stored = inserted.rows[0];
+    if (!stored) throw AppError.internal('Voice message could not be stored');
+
+    await tx.query(
+      `UPDATE conversations SET last_message_at = now(), last_message_preview = $2 WHERE id = $1`,
+      [conversationId, '🎤 Voice message'],
+    );
+    await tx.query(
+      `UPDATE conversation_participants SET last_read_at = now()
+        WHERE conversation_id = $1 AND user_id = $2`,
+      [conversationId, actor.userId],
+    );
+    await tx.query(
+      `UPDATE conversation_participants SET deleted_at = NULL
+        WHERE conversation_id = $1 AND deleted_at IS NOT NULL`,
+      [conversationId],
+    );
+
+    await publishEvent(
+      tx,
+      'chat.message_sent',
+      { organizationId: actor.organizationId, conversationId, messageId: stored.id, senderId: actor.userId },
+      { organizationId: actor.organizationId, actorId: actor.userId },
+    );
+
+    return stored;
+  });
+
+  const sender = await queryOne<{ full_name: string }>(`SELECT full_name FROM users WHERE id = $1`, [
+    actor.userId,
+  ]);
+
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    senderId: row.sender_id,
+    senderName: sender?.full_name ?? 'You',
+    body: row.body,
+    threadParentId: row.thread_parent_id,
+    replyToId: row.reply_to_id,
+    attachments: await resolveAttachments(row.attachments ?? []),
+    reactions: row.reactions ?? {},
+    mentions: row.mentions ?? [],
+    isEdited: row.is_edited,
+    isMine: true,
+    status: 'sent',
     createdAt: new Date(row.created_at).toISOString(),
   };
 }
@@ -777,7 +1014,9 @@ export async function markConversationRead(actor: Actor, conversationId: string)
   await requireMembership(actor.userId, actor.organizationId);
   await assertParticipant(conversationId, actor.userId);
   await query(
-    `UPDATE conversation_participants SET last_read_at = now()
+    // Reading implies delivery, so both watermarks move together — a reader
+    // can never appear "read but not delivered".
+    `UPDATE conversation_participants SET last_read_at = now(), last_delivered_at = now()
       WHERE conversation_id = $1 AND user_id = $2`,
     [conversationId, actor.userId],
   );

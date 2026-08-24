@@ -1,13 +1,24 @@
 import { Router, type Request, type Response } from 'express';
+import multer from 'multer';
 import { z } from 'zod';
 import { authenticate, requireOrganization } from '../../platform/authentication/authenticate.js';
 import { asyncHandler } from '../../platform/http/async-handler.js';
+import { rateLimit } from '../../platform/http/rate-limit.js';
 import { parseBody, parseParams, parseQuery } from '../../platform/http/validate.js';
+import { AppError } from '../../platform/errors/app-error.js';
 import * as service from './messaging.service.js';
 
 export const messagingRoutes = Router();
 
 messagingRoutes.use(authenticate());
+
+// Buffered in memory, then streamed to object storage. 10 MB comfortably
+// covers a compressed voice note; the service enforces the same limit so an
+// oversized body is rejected even if this changes later.
+const uploadVoiceMessage = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
 
 function actorOf(req: Request): service.Actor {
   const { user, organizationId } = requireOrganization(req);
@@ -125,6 +136,39 @@ messagingRoutes.post(
     );
     const message = await service.sendMessage(actorOf(req), conversationId, body);
     res.status(201).json({ message: 'Message sent', data: message });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/voice-message',
+  rateLimit({ bucket: 'upload', windowSeconds: 60, max: 120 }),
+  uploadVoiceMessage.single('audio'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    const uploaded = req.file;
+    if (!uploaded) throw AppError.validation('No recording was included in the upload');
+
+    const { durationSeconds } = parseBody(
+      z.object({ durationSeconds: z.coerce.number().int().min(0).max(3600).optional() }),
+      req,
+    );
+
+    const message = await service.sendVoiceMessage(actorOf(req), conversationId, {
+      buffer: uploaded.buffer,
+      mimeType: uploaded.mimetype || 'audio/webm',
+      size: uploaded.size,
+      durationSeconds,
+    });
+    res.status(201).json({ message: 'Voice message sent', data: message });
+  }),
+);
+
+messagingRoutes.post(
+  '/conversations/:conversationId/clear',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    await service.clearConversationHistory(actorOf(req), conversationId);
+    res.json({ message: 'Chat cleared' });
   }),
 );
 
