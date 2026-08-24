@@ -45,6 +45,7 @@ export interface ContactView {
   team: string | null;
   labels: string[];
   isFavourite: boolean;
+  isBlocked: boolean;
   source: 'manual' | 'chat_request' | 'import';
   /** Null for external contacts, who have no account and so no presence. */
   presence: PresenceStatus | null;
@@ -104,6 +105,7 @@ function mapContact(row: Record<string, any>): ContactView {
     team: row.team ?? null,
     labels: row.labels ?? [],
     isFavourite: row.is_favourite,
+    isBlocked: row.is_blocked,
     source: row.source,
     presence: isPlatformUser
       ? effectivePresence({ status: row.status, lastSeenAt: row.last_seen_at })
@@ -119,7 +121,7 @@ function mapContact(row: Record<string, any>): ContactView {
 
 const CONTACT_SELECT = `
   SELECT c.id, c.contact_user_id, c.display_name, c.email, c.phone, c.company,
-         c.job_title, c.notes, c.is_favourite, c.source, c.created_at,
+         c.job_title, c.notes, c.is_favourite, c.is_blocked, c.source, c.created_at,
          c.address, c.website, c.birthday, c.department, c.team, c.labels,
          u.username, u.avatar_url,
          p.status, p.status_text, p.status_emoji, p.last_seen_at
@@ -313,6 +315,40 @@ export async function updateContact(
   if (result.rowCount === 0) throw AppError.notFound('Contact not found');
 
   return getContact(actor, contactId);
+}
+
+/**
+ * Blocks or unblocks a contact. Separate from `updateContact` because it is a
+ * relationship decision with a security consequence — `messaging.service`
+ * consults `isBlockedBetween` before a message is allowed through — rather
+ * than an address-book edit.
+ */
+export async function setBlocked(actor: Actor, contactId: string, isBlocked: boolean): Promise<ContactView> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const result = await query(
+    `UPDATE contacts SET is_blocked = $3, updated_at = now() WHERE id = $1 AND owner_id = $2`,
+    [contactId, actor.userId, isBlocked],
+  );
+  if (result.rowCount === 0) throw AppError.notFound('Contact not found');
+
+  return getContact(actor, contactId);
+}
+
+/**
+ * Whether either side of this pair has blocked the other. Messaging checks
+ * this in both directions: the sender may have blocked the recipient, or the
+ * recipient may have blocked the sender — either should stop the message.
+ */
+export async function isBlockedBetween(userId: string, otherUserId: string): Promise<boolean> {
+  const row = await queryOne(
+    `SELECT 1 FROM contacts
+      WHERE is_blocked = true
+        AND ((owner_id = $1 AND contact_user_id = $2) OR (owner_id = $2 AND contact_user_id = $1))
+      LIMIT 1`,
+    [userId, otherUserId],
+  );
+  return Boolean(row);
 }
 
 export async function deleteContact(actor: Actor, contactId: string): Promise<void> {

@@ -84,6 +84,17 @@ messagingRoutes.get(
   }),
 );
 
+// Declared before /conversations/:conversationId/... so "with" is never
+// mistaken for a conversation id.
+messagingRoutes.get(
+  '/conversations/with/:userId',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { userId } = parseParams(z.object({ userId: z.string().uuid('Invalid user id') }), req);
+    const conversationId = await service.findOrReviveDirectConversation(actorOf(req), userId);
+    res.json({ conversationId });
+  }),
+);
+
 messagingRoutes.get(
   '/conversations/:conversationId/messages',
   asyncHandler(async (req: Request, res: Response) => {
@@ -123,6 +134,23 @@ messagingRoutes.post(
     const { conversationId } = parseParams(conversationParams, req);
     await service.markConversationRead(actorOf(req), conversationId);
     res.json({ message: 'Conversation marked as read' });
+  }),
+);
+
+messagingRoutes.get(
+  '/conversations/:conversationId/media',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    res.json({ media: await service.listMedia(actorOf(req), conversationId) });
+  }),
+);
+
+messagingRoutes.delete(
+  '/conversations/:conversationId',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { conversationId } = parseParams(conversationParams, req);
+    await service.deleteConversation(actorOf(req), conversationId);
+    res.json({ message: 'Chat deleted' });
   }),
 );
 

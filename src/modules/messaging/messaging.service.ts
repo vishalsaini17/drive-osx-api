@@ -2,7 +2,7 @@ import { AppError } from '../../platform/errors/app-error.js';
 import { publishEvent } from '../../platform/events/event-bus.js';
 import { requireMembership } from '../../platform/authorization/access-control.js';
 import { query, queryMany, queryOne, withTransaction } from '../../infrastructure/database/pool.js';
-import { effectivePresence } from '../contacts/contacts.service.js';
+import { effectivePresence, isBlockedBetween } from '../contacts/contacts.service.js';
 
 /**
  * Direct messaging.
@@ -229,6 +229,10 @@ export async function sendChatRequest(
     [input.recipientId],
   );
   if (!recipient) throw AppError.notFound('That user was not found');
+
+  if (await isBlockedBetween(actor.userId, input.recipientId)) {
+    throw AppError.permission('You cannot send a chat request to this person');
+  }
 
   // An existing conversation means there is nothing to request.
   if (await findDirectConversationId(actor.userId, input.recipientId)) {
@@ -457,6 +461,7 @@ export async function listConversations(actor: Actor): Promise<ConversationView[
             ) AS unread_count
        FROM conversations c
        JOIN conversation_participants cp ON cp.conversation_id = c.id AND cp.user_id = $1
+      WHERE cp.deleted_at IS NULL
       ORDER BY cp.is_pinned DESC, c.last_message_at DESC NULLS LAST`,
     [actor.userId],
   );
@@ -508,6 +513,123 @@ async function assertParticipant(conversationId: string, userId: string): Promis
   }
 }
 
+/** The other people in a conversation, for direct conversations always exactly one. */
+async function otherParticipantIds(conversationId: string, userId: string): Promise<string[]> {
+  const rows = await queryMany<{ user_id: string }>(
+    `SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id <> $2`,
+    [conversationId, userId],
+  );
+  return rows.map((row) => row.user_id);
+}
+
+/**
+ * Deletes a conversation for the caller only, WhatsApp-style: their row in
+ * `conversation_participants` is marked deleted so it drops out of their
+ * list, but the conversation, its messages and the other participant's copy
+ * are untouched.
+ *
+ * Two things happen, and they behave differently over time:
+ * - `deleted_at` hides the conversation from the caller's list. A later
+ *   message from either side clears it again (see `sendMessage`), so the
+ *   thread reappears rather than staying hidden from someone actively being
+ *   messaged.
+ * - `history_cleared_at` is a permanent cutoff: `listMessages` and
+ *   `listMedia` hide anything at or before it for this participant, and
+ *   nothing clears it automatically. So when the thread reappears, the
+ *   caller sees only what was sent after they deleted it — the other
+ *   participant, who has no cutoff, keeps their full history.
+ */
+export async function deleteConversation(actor: Actor, conversationId: string): Promise<void> {
+  await requireMembership(actor.userId, actor.organizationId);
+  const result = await query(
+    `UPDATE conversation_participants SET deleted_at = now(), history_cleared_at = now()
+      WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, actor.userId],
+  );
+  if (result.rowCount === 0) throw AppError.notFound('Conversation not found');
+}
+
+/**
+ * Finds an existing direct conversation with another user, reviving it (but
+ * not its cleared history — see `deleteConversation`) if the caller had
+ * deleted their copy.
+ *
+ * "Start a conversation" calls this before offering a chat request: without
+ * it, picking someone you already have a conversation with — just hidden
+ * because you deleted it — hits `sendChatRequest`'s "you can already message
+ * this person" conflict with no way back in, since the thread that would
+ * explain that is exactly the one that is hidden.
+ */
+export async function findOrReviveDirectConversation(actor: Actor, otherUserId: string): Promise<string | null> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const conversationId = await findDirectConversationId(actor.userId, otherUserId);
+  if (!conversationId) return null;
+
+  await query(
+    `UPDATE conversation_participants SET deleted_at = NULL
+      WHERE conversation_id = $1 AND user_id = $2 AND deleted_at IS NOT NULL`,
+    [conversationId, actor.userId],
+  );
+
+  return conversationId;
+}
+
+export interface MediaItemView {
+  id: string;
+  messageId: string;
+  conversationId: string;
+  isMine: boolean;
+  createdAt: string;
+  name: string;
+  url: string | null;
+  mimeType: string | null;
+  size: number | null;
+}
+
+/** Attachments shared in a conversation, newest first — the panel's media tab. */
+export async function listMedia(actor: Actor, conversationId: string): Promise<MediaItemView[]> {
+  await requireMembership(actor.userId, actor.organizationId);
+  await assertParticipant(conversationId, actor.userId);
+
+  const rows = await queryMany<{
+    id: string;
+    conversation_id: string;
+    sender_id: string | null;
+    attachments: Array<Record<string, any>>;
+    created_at: string;
+  }>(
+    `SELECT m.id, m.conversation_id, m.sender_id, m.attachments, m.created_at
+       FROM messages m
+       JOIN conversation_participants cp
+         ON cp.conversation_id = m.conversation_id AND cp.user_id = $2
+      WHERE m.conversation_id = $1
+        AND m.deleted_at IS NULL
+        AND jsonb_array_length(m.attachments) > 0
+        AND (cp.history_cleared_at IS NULL OR m.created_at > cp.history_cleared_at)
+      ORDER BY m.created_at DESC`,
+    [conversationId, actor.userId],
+  );
+
+  const items: MediaItemView[] = [];
+  for (const row of rows) {
+    row.attachments.forEach((attachment, index) => {
+      items.push({
+        id: `${row.id}:${attachment.id ?? index}`,
+        messageId: row.id,
+        conversationId: row.conversation_id,
+        isMine: row.sender_id === actor.userId,
+        createdAt: new Date(row.created_at).toISOString(),
+        name: attachment.name ?? 'Attachment',
+        url: attachment.url ?? null,
+        mimeType: attachment.mimeType ?? attachment.type ?? null,
+        size: typeof attachment.size === 'number' ? attachment.size : null,
+      });
+    });
+  }
+  return items;
+}
+
 export async function listMessages(
   actor: Actor,
   conversationId: string,
@@ -522,13 +644,18 @@ export async function listMessages(
             m.attachments, m.reactions, m.mentions, m.is_edited, m.created_at,
             coalesce(u.full_name, 'Removed user') AS sender_name
        FROM messages m
+       JOIN conversation_participants cp
+         ON cp.conversation_id = m.conversation_id AND cp.user_id = $4
        LEFT JOIN users u ON u.id = m.sender_id
       WHERE m.conversation_id = $1
         AND m.deleted_at IS NULL
         AND ($2::timestamptz IS NULL OR m.created_at < $2)
+        -- A cleared history stays cleared even after the conversation
+        -- reappears (see deleteConversation's doc comment).
+        AND (cp.history_cleared_at IS NULL OR m.created_at > cp.history_cleared_at)
       ORDER BY m.created_at DESC
       LIMIT $3`,
-    [conversationId, options.before ?? null, limit],
+    [conversationId, options.before ?? null, limit, actor.userId],
   );
 
   // Query is newest-first for the limit; the client wants oldest-first.
@@ -559,6 +686,13 @@ export async function sendMessage(
 
   const body = input.body.trim();
   if (!body) throw AppError.validation('A message cannot be empty');
+
+  const others = await otherParticipantIds(conversationId, actor.userId);
+  for (const otherId of others) {
+    if (await isBlockedBetween(actor.userId, otherId)) {
+      throw AppError.permission('You cannot message this person while blocked');
+    }
+  }
 
   const row = await withTransaction(async (tx) => {
     const inserted = await tx.query<MessageRow>(
@@ -593,6 +727,14 @@ export async function sendMessage(
       `UPDATE conversation_participants SET last_read_at = now()
         WHERE conversation_id = $1 AND user_id = $2`,
       [conversationId, actor.userId],
+    );
+
+    // A new message means the conversation is active again — for whichever
+    // side had previously deleted it (see `deleteConversation`'s doc comment).
+    await tx.query(
+      `UPDATE conversation_participants SET deleted_at = NULL
+        WHERE conversation_id = $1 AND deleted_at IS NOT NULL`,
+      [conversationId],
     );
 
     await publishEvent(

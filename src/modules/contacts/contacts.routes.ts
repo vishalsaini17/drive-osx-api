@@ -130,3 +130,21 @@ contactRoutes.delete(
     res.json({ message: 'Contact removed' });
   }),
 );
+
+contactRoutes.post(
+  '/:contactId/block',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { contactId } = parseParams(contactParams, req);
+    const contact = await service.setBlocked(actorOf(req), contactId, true);
+    res.json({ message: 'Contact blocked', contact });
+  }),
+);
+
+contactRoutes.post(
+  '/:contactId/unblock',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { contactId } = parseParams(contactParams, req);
+    const contact = await service.setBlocked(actorOf(req), contactId, false);
+    res.json({ message: 'Contact unblocked', contact });
+  }),
+);
