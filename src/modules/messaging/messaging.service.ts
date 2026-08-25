@@ -22,6 +22,9 @@ export interface Actor {
   organizationId: string;
 }
 
+/** A sent message can only be edited within this window afterward. */
+const EDIT_WINDOW_MS = 60_000;
+
 export interface UserSummary {
   id: string;
   username: string;
@@ -1443,7 +1446,8 @@ export async function editMessage(actor: Actor, messageId: string, body: string)
     sender_id: string | null;
     deleted_at: string | null;
     attachments: StoredAttachment[];
-  }>(`SELECT sender_id, deleted_at, attachments FROM messages WHERE id = $1`, [messageId]);
+    created_at: string;
+  }>(`SELECT sender_id, deleted_at, attachments, created_at FROM messages WHERE id = $1`, [messageId]);
 
   if (!existing || existing.sender_id !== actor.userId) {
     throw AppError.notFound('Message not found, or it is not yours to edit');
@@ -1454,6 +1458,11 @@ export async function editMessage(actor: Actor, messageId: string, body: string)
   // behind it. Editing is text-messages-only until that changes.
   if ((existing.attachments ?? []).length > 0) {
     throw AppError.validation('Only text messages can be edited');
+  }
+  // Mirrors the UI's edit window (EDIT_WINDOW_MS in the messages app) so the
+  // rule holds even if someone calls this endpoint directly.
+  if (Date.now() - new Date(existing.created_at).getTime() > EDIT_WINDOW_MS) {
+    throw AppError.validation('This message can no longer be edited');
   }
 
   await query(`UPDATE messages SET body = $2, is_edited = true, edited_at = now() WHERE id = $1`, [
