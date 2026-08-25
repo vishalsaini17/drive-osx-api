@@ -1433,6 +1433,36 @@ export type DeleteMessageMode = 'me' | 'everyone';
  * poll; returns null for `'me'`, since that view only makes sense for other
  * participants, who did not just delete anything.
  */
+export async function editMessage(actor: Actor, messageId: string, body: string): Promise<MessageView> {
+  await requireMembership(actor.userId, actor.organizationId);
+
+  const trimmed = body.trim();
+  if (!trimmed) throw AppError.validation('A message cannot be empty');
+
+  const existing = await queryOne<{
+    sender_id: string | null;
+    deleted_at: string | null;
+    attachments: StoredAttachment[];
+  }>(`SELECT sender_id, deleted_at, attachments FROM messages WHERE id = $1`, [messageId]);
+
+  if (!existing || existing.sender_id !== actor.userId) {
+    throw AppError.notFound('Message not found, or it is not yours to edit');
+  }
+  if (existing.deleted_at) throw AppError.validation('This message was deleted and cannot be edited');
+  // Attachment messages have no caption UI — the view always renders the
+  // attachment in place of the body, so an edited body would silently vanish
+  // behind it. Editing is text-messages-only until that changes.
+  if ((existing.attachments ?? []).length > 0) {
+    throw AppError.validation('Only text messages can be edited');
+  }
+
+  await query(`UPDATE messages SET body = $2, is_edited = true, edited_at = now() WHERE id = $1`, [
+    messageId,
+    trimmed.slice(0, 8000),
+  ]);
+
+  return getMessageView(actor, messageId);
+}
 export async function deleteMessage(
   actor: Actor,
   messageId: string,

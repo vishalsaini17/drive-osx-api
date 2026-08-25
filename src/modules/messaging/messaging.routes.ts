@@ -325,6 +325,16 @@ messagingRoutes.delete(
   }),
 );
 
+messagingRoutes.patch(
+  '/messages/:messageId',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { messageId } = parseParams(messageParams, req);
+    const { body } = parseBody(z.object({ body: z.string().trim().min(1, 'A message cannot be empty').max(8000) }), req);
+    const data = await service.editMessage(actorOf(req), messageId, body);
+    res.json({ message: 'Message edited', data });
+  }),
+);
+
 messagingRoutes.delete(
   '/messages/:messageId',
   asyncHandler(async (req: Request, res: Response) => {
