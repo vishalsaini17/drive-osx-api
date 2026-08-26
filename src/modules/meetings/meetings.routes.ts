@@ -9,7 +9,10 @@ export const meetingRoutes = Router();
 
 meetingRoutes.use(authenticate());
 
-const meetingParams = z.object({ meetingId: z.string().uuid('Invalid meeting id') });
+// Not enforced as a UUID: "Join with a Code or Link" sends the human-readable
+// meeting code (e.g. "abc-defg-hij"), not the database id — loadMeeting()
+// resolves either.
+const meetingParams = z.object({ meetingId: z.string().trim().min(1, 'Invalid meeting id') });
 
 const createSchema = z.object({
   title: z.string().trim().max(200).optional(),
@@ -22,6 +25,7 @@ const createSchema = z.object({
   allowChat: z.boolean().optional(),
   allowUnmute: z.boolean().optional(),
   allowRecording: z.boolean().optional(),
+  conversationId: z.string().uuid().optional(),
 });
 
 function actorOf(req: Request): service.Actor {

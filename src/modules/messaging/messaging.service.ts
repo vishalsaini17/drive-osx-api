@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AppError } from '../../platform/errors/app-error.js';
 import { publishEvent } from '../../platform/events/event-bus.js';
 import { requireMembership } from '../../platform/authorization/access-control.js';
-import { query, queryMany, queryOne, withTransaction } from '../../infrastructure/database/pool.js';
+import { query, queryMany, queryOne, withTransaction, type Queryable } from '../../infrastructure/database/pool.js';
 import { effectivePresence, isBlockedBetween } from '../contacts/contacts.service.js';
 import { objectKeys } from '../../infrastructure/storage/object-storage.js';
 import { objectStorage } from '../../infrastructure/storage/s3-object-storage.js';
@@ -491,13 +491,14 @@ async function addContactTx(
   organizationId: string,
   ownerId: string,
   contactUserId: string,
+  source: 'chat_request' | 'meeting' = 'chat_request',
 ): Promise<void> {
   await tx.query(
     `INSERT INTO contacts (organization_id, owner_id, contact_user_id, display_name, email, source)
-     SELECT $1, $2, u.id, u.full_name, u.email, 'chat_request'
+     SELECT $1, $2, u.id, u.full_name, u.email, $4
        FROM users u WHERE u.id = $3
      ON CONFLICT (owner_id, contact_user_id) WHERE contact_user_id IS NOT NULL DO NOTHING`,
-    [organizationId, ownerId, contactUserId],
+    [organizationId, ownerId, contactUserId, source],
   );
 }
 
@@ -601,39 +602,130 @@ export async function createGroupConversation(actor: Actor, input: CreateGroupIn
     throw AppError.validation('You can only add people from your contacts to a group');
   }
 
-  const conversationId = await withTransaction(async (tx) => {
-    const conversation = await tx.query<{ id: string }>(
-      `INSERT INTO conversations (organization_id, kind, title, created_by) VALUES ($1, 'group', $2, $3) RETURNING id`,
-      [actor.organizationId, title, actor.userId],
-    );
-    const id = conversation.rows[0]?.id;
-    if (!id) throw AppError.internal('Group could not be created');
-
-    await tx.query(
-      `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'owner')`,
-      [id, actor.userId],
-    );
-    for (const memberId of memberIds) {
-      await tx.query(
-        `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`,
-        [id, memberId],
-      );
-    }
-
-    await publishEvent(
-      tx,
-      'chat.group_created',
-      { organizationId: actor.organizationId, conversationId: id, createdBy: actor.userId, memberIds },
-      { organizationId: actor.organizationId, actorId: actor.userId },
-    );
-
-    return id;
-  });
+  const conversationId = await withTransaction(async (tx) =>
+    createGroupConversationTx(tx, actor.organizationId, title, actor.userId, memberIds),
+  );
 
   const conversations = await listConversations(actor);
   const created = conversations.find((conversation) => conversation.id === conversationId);
   if (!created) throw AppError.internal('Group could not be created');
   return created;
+}
+
+/** Shared by the contacts-gated public `createGroupConversation` and the meeting-triggered path below. */
+async function createGroupConversationTx(
+  tx: Queryable,
+  organizationId: string,
+  title: string,
+  ownerUserId: string,
+  memberUserIds: string[],
+): Promise<string> {
+  const conversation = await tx.query<{ id: string }>(
+    `INSERT INTO conversations (organization_id, kind, title, created_by) VALUES ($1, 'group', $2, $3) RETURNING id`,
+    [organizationId, title, ownerUserId],
+  );
+  const id = conversation.rows[0]?.id;
+  if (!id) throw AppError.internal('Group could not be created');
+
+  await tx.query(
+    `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'owner')`,
+    [id, ownerUserId],
+  );
+  for (const memberId of memberUserIds) {
+    await tx.query(
+      `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')`,
+      [id, memberId],
+    );
+  }
+
+  await publishEvent(
+    tx,
+    'chat.group_created',
+    { organizationId, conversationId: id, createdBy: ownerUserId, memberIds: memberUserIds },
+    { organizationId, actorId: ownerUserId },
+  );
+
+  return id;
+}
+
+/**
+ * Links a meeting to the conversation its chat and shared files live in.
+ *
+ * Called after each join, with every distinct user who has ever joined the
+ * meeting. Two participants get a direct conversation; three or more get a
+ * group — a direct conversation cannot hold a third member, so gaining one
+ * always means creating a fresh group rather than growing the old DM (whose
+ * history is left untouched). Once a group exists for the meeting, later
+ * joiners are simply added to it.
+ *
+ * Unlike `createGroupConversation`/`addGroupMember`, this does not require
+ * the participants to already be contacts, and does not gate on group-admin
+ * role — the authorization boundary here is "you were let into the meeting"
+ * (passcode/lock/waiting-room, enforced by `joinMeeting`), not the messaging
+ * module's normal contact/admin rules. It creates the contact relationship
+ * itself instead, mirroring the precedent that accepting a chat request also
+ * adds both sides as contacts (`respondToChatRequest` above).
+ */
+export async function ensureConversationForMeeting(
+  organizationId: string,
+  participantUserIds: string[],
+  title: string,
+  currentConversationId: string | null,
+): Promise<{ conversationId: string; created: boolean } | null> {
+  const distinct = Array.from(new Set(participantUserIds));
+  if (distinct.length < 2) return null;
+
+  if (currentConversationId) {
+    const existing = await queryOne<{ kind: string }>(`SELECT kind FROM conversations WHERE id = $1`, [
+      currentConversationId,
+    ]);
+    if (existing?.kind === 'group') {
+      const memberRows = await queryMany<{ user_id: string }>(
+        `SELECT user_id FROM conversation_participants WHERE conversation_id = $1`,
+        [currentConversationId],
+      );
+      const memberIds = new Set(memberRows.map((row) => row.user_id));
+      const newcomers = distinct.filter((id) => !memberIds.has(id));
+      if (newcomers.length > 0) {
+        await withTransaction(async (tx) => {
+          for (const userId of newcomers) {
+            await tx.query(
+              `INSERT INTO conversation_participants (conversation_id, user_id, role) VALUES ($1, $2, 'member')
+               ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+              [currentConversationId, userId],
+            );
+          }
+        });
+      }
+      return { conversationId: currentConversationId, created: false };
+    }
+  }
+
+  if (distinct.length === 2) {
+    const [a, b] = [distinct[0]!, distinct[1]!];
+    const conversationId = await withTransaction(async (tx) => {
+      const id = await createDirectConversationTx(tx, organizationId, a, b);
+      await addContactTx(tx, organizationId, a, b, 'meeting');
+      await addContactTx(tx, organizationId, b, a, 'meeting');
+      return id;
+    });
+    return { conversationId, created: currentConversationId !== conversationId };
+  }
+
+  const owner = distinct[0]!;
+  const members = distinct.slice(1);
+  const conversationId = await withTransaction(async (tx) => {
+    for (let i = 0; i < distinct.length; i += 1) {
+      for (let j = i + 1; j < distinct.length; j += 1) {
+        const left = distinct[i]!;
+        const right = distinct[j]!;
+        await addContactTx(tx, organizationId, left, right, 'meeting');
+        await addContactTx(tx, organizationId, right, left, 'meeting');
+      }
+    }
+    return createGroupConversationTx(tx, organizationId, title, owner, members);
+  });
+  return { conversationId, created: true };
 }
 
 async function assertGroup(conversationId: string): Promise<void> {
@@ -813,7 +905,7 @@ export async function reportGroup(actor: Actor, conversationId: string, reason: 
   });
 }
 
-async function assertParticipant(conversationId: string, userId: string): Promise<void> {
+export async function assertParticipant(conversationId: string, userId: string): Promise<void> {
   const row = await queryOne(
     `SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2`,
     [conversationId, userId],

@@ -4,6 +4,7 @@ import { publishEvent } from '../../platform/events/event-bus.js';
 import { requireMembership } from '../../platform/authorization/access-control.js';
 import { query, queryMany, queryOne, withTransaction } from '../../infrastructure/database/pool.js';
 import { findUserById } from '../identity/identity.repository.js';
+import { assertParticipant, ensureConversationForMeeting } from '../messaging/messaging.service.js';
 
 export interface MeetingParticipantView {
   id: string;
@@ -43,6 +44,7 @@ export interface MeetingView {
   allowUnmute: boolean;
   allowRecording: boolean;
   isLocked: boolean;
+  conversationId: string | null;
   participants: MeetingParticipantView[];
   chatMessages: MeetingMessageView[];
 }
@@ -64,11 +66,13 @@ interface MeetingRow {
   allow_unmute: boolean;
   allow_recording: boolean;
   is_locked: boolean;
+  conversation_id: string | null;
 }
 
 const MEETING_COLUMNS = `
   id, organization_id, host_id, code, title, description, status, start_time, end_time,
-  passcode, waiting_room_enabled, allow_screen_share, allow_chat, allow_unmute, allow_recording, is_locked
+  passcode, waiting_room_enabled, allow_screen_share, allow_chat, allow_unmute, allow_recording, is_locked,
+  conversation_id
 `;
 
 /** The passcode is never returned — only whether one is required. */
@@ -95,6 +99,7 @@ function toMeetingView(
     allowUnmute: row.allow_unmute,
     allowRecording: row.allow_recording,
     isLocked: row.is_locked,
+    conversationId: row.conversation_id,
     participants,
     chatMessages,
   };
@@ -155,15 +160,44 @@ async function loadMessages(meetingId: string, limit = 200): Promise<MeetingMess
   }));
 }
 
+/**
+ * Resolves either the database id or the human-readable share code — the
+ * lobby's "Join with a Code or Link" only ever has the latter. `id::text = $1`
+ * is a safe no-op comparison when `$1` isn't a UUID at all (never throws,
+ * never matches), so one query covers both without a separate lookup path.
+ */
 async function loadMeeting(meetingId: string): Promise<MeetingRow> {
-  const row = await queryOne<MeetingRow>(`SELECT ${MEETING_COLUMNS} FROM meetings WHERE id = $1`, [meetingId]);
+  const row = await queryOne<MeetingRow>(
+    `SELECT ${MEETING_COLUMNS} FROM meetings WHERE id::text = $1 OR code = $1`,
+    [meetingId],
+  );
   if (!row) throw AppError.notFound('Meeting not found');
   return row;
 }
 
-/** Anyone in the workspace may see a meeting; only the host controls it. */
+/**
+ * Anyone who is signed in and knows the meeting's id/code may see and join
+ * it; only the host controls it (start/end/lock stay host-only, checked at
+ * each of those call sites).
+ *
+ * This deliberately does not require the caller to share the meeting's
+ * organization. Messaging already treats cross-org contact as first-class —
+ * two people connect by chat request regardless of organization, with no
+ * further org check on either side once they have (`assertParticipant` in
+ * the messaging module checks conversation membership, not org membership).
+ * A call started from that conversation is the natural next step for the
+ * same two people, so gating the *meeting* on shared org membership would
+ * silently strand exactly the users the request was addressed to — the join
+ * possession check is the id/code itself, same as any real Meet/Zoom link,
+ * with the passcode/lock/waiting-room settings layered on top as the host's
+ * actual controls (checked in `joinMeeting`).
+ */
 async function assertCanView(actor: Actor, meeting: MeetingRow): Promise<void> {
-  await requireMembership(actor.userId, meeting.organization_id);
+  // Confirms the caller is a real, active member of *an* organization — a
+  // sanity check on the actor, not a claim that it must be this meeting's.
+  // Already guaranteed by the route layer resolving `actor.organizationId`
+  // from `requireOrganization`, but asserted here too rather than assumed.
+  await requireMembership(actor.userId, actor.organizationId);
 }
 
 export interface CreateMeetingInput {
@@ -177,17 +211,27 @@ export interface CreateMeetingInput {
   allowChat?: boolean;
   allowUnmute?: boolean;
   allowRecording?: boolean;
+  /** The conversation this call was started from (e.g. the video-call button in Messages), if any. */
+  conversationId?: string;
 }
 
 export async function createMeeting(actor: Actor, input: CreateMeetingInput): Promise<MeetingView> {
   const host = await findUserById(actor.userId);
   if (!host) throw AppError.notFound('User not found');
 
+  // Only link to a conversation the caller can actually see into — otherwise
+  // a crafted request could drop a meeting's future chat/files into someone
+  // else's conversation.
+  if (input.conversationId) {
+    await assertParticipant(input.conversationId, actor.userId);
+  }
+
   const row = await withTransaction(async (tx) => {
     const { rows } = await tx.query<MeetingRow>(
       `INSERT INTO meetings (organization_id, host_id, code, title, description, status, start_time, end_time,
-                             passcode, waiting_room_enabled, allow_screen_share, allow_chat, allow_unmute, allow_recording)
-       VALUES ($1, $2, $3, $4, $5, 'scheduled', $6, $7, $8, $9, $10, $11, $12, $13)
+                             passcode, waiting_room_enabled, allow_screen_share, allow_chat, allow_unmute, allow_recording,
+                             conversation_id)
+       VALUES ($1, $2, $3, $4, $5, 'scheduled', $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING ${MEETING_COLUMNS}`,
       [
         actor.organizationId,
@@ -203,6 +247,7 @@ export async function createMeeting(actor: Actor, input: CreateMeetingInput): Pr
         input.allowChat ?? true,
         input.allowUnmute ?? true,
         input.allowRecording ?? true,
+        input.conversationId ?? null,
       ],
     );
 
@@ -229,6 +274,11 @@ export async function createMeeting(actor: Actor, input: CreateMeetingInput): Pr
 
 export async function getMeeting(actor: Actor, meetingId: string): Promise<MeetingView> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
   await assertCanView(actor, meeting);
   return toMeetingView(meeting, await loadParticipants(meetingId), await loadMessages(meetingId));
 }
@@ -285,6 +335,11 @@ export async function listTodayMeetings(actor: Actor): Promise<MeetingView[]> {
 
 export async function startMeeting(actor: Actor, meetingId: string): Promise<MeetingView> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
   await assertCanView(actor, meeting);
 
   if (meeting.host_id !== actor.userId) {
@@ -303,6 +358,11 @@ export async function startMeeting(actor: Actor, meetingId: string): Promise<Mee
 
 export async function joinMeeting(actor: Actor, meetingId: string, passcode?: string): Promise<MeetingView> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
   await assertCanView(actor, meeting);
 
   if (meeting.status === 'ended') throw AppError.validation('This meeting has already ended');
@@ -326,11 +386,45 @@ export async function joinMeeting(actor: Actor, meetingId: string, passcode?: st
     [meetingId, actor.userId, user.full_name || user.username, meeting.host_id === actor.userId ? 'host' : 'participant'],
   );
 
-  return toMeetingView(meeting, await loadParticipants(meetingId), await loadMessages(meetingId));
+  const updatedMeeting = await linkMeetingConversation(meeting);
+
+  return toMeetingView(updatedMeeting, await loadParticipants(meetingId), await loadMessages(meetingId));
+}
+
+/**
+ * Links (or grows) the meeting's conversation from everyone who has ever
+ * joined. See `ensureConversationForMeeting` for the direct-vs-group and
+ * contact rules; this just persists whatever it decides onto the meeting row.
+ */
+async function linkMeetingConversation(meeting: MeetingRow): Promise<MeetingRow> {
+  const rows = await queryMany<{ user_id: string }>(
+    `SELECT DISTINCT user_id FROM meeting_participants WHERE meeting_id = $1 AND user_id IS NOT NULL`,
+    [meeting.id],
+  );
+  const participantUserIds = rows.map((row) => row.user_id);
+
+  const result = await ensureConversationForMeeting(
+    meeting.organization_id,
+    participantUserIds,
+    meeting.title,
+    meeting.conversation_id,
+  );
+  if (!result || result.conversationId === meeting.conversation_id) return meeting;
+
+  const updated = await queryOne<MeetingRow>(
+    `UPDATE meetings SET conversation_id = $2 WHERE id = $1 RETURNING ${MEETING_COLUMNS}`,
+    [meeting.id, result.conversationId],
+  );
+  return updated ?? meeting;
 }
 
 export async function leaveMeeting(actor: Actor, meetingId: string): Promise<{ message: string; ended: boolean }> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
 
   await query(
     'UPDATE meeting_participants SET left_at = now() WHERE meeting_id = $1 AND user_id = $2 AND left_at IS NULL',
@@ -364,6 +458,11 @@ async function endMeetingInternal(meetingId: string, organizationId: string, act
 
 export async function endMeeting(actor: Actor, meetingId: string): Promise<MeetingView> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
   await assertCanView(actor, meeting);
 
   if (meeting.host_id !== actor.userId) {
@@ -380,6 +479,11 @@ export async function sendChatMessage(
   text: string,
 ): Promise<MeetingMessageView> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
   await assertCanView(actor, meeting);
 
   if (!meeting.allow_chat && meeting.host_id !== actor.userId) {
@@ -410,6 +514,11 @@ export async function updateParticipantState(
   updates: { isMuted?: boolean; isVideoOn?: boolean },
 ): Promise<MeetingParticipantView[]> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
   await assertCanView(actor, meeting);
 
   if (updates.isMuted === false && !meeting.allow_unmute && meeting.host_id !== actor.userId) {
@@ -433,6 +542,11 @@ export async function updateParticipantState(
 
 export async function setLocked(actor: Actor, meetingId: string, isLocked: boolean): Promise<MeetingView> {
   const meeting = await loadMeeting(meetingId);
+  // `meetingId` may have arrived as the human-readable share code rather than
+  // the database id (the lobby's "Join with a Code or Link" only ever has
+  // the former) — every query below is against uuid columns, so it must use
+  // the real id `loadMeeting` just resolved.
+  meetingId = meeting.id;
 
   if (meeting.host_id !== actor.userId) {
     throw AppError.permission('Only the host can lock or unlock this meeting');

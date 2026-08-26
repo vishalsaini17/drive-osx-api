@@ -119,6 +119,20 @@ async function handleMessage(socket: WebSocket, raw: string): Promise<void> {
       });
       break;
 
+    // Mic/camera toggle, broadcast to the whole room rather than one target —
+    // every tile in the call needs to reflect it, not just one peer.
+    case 'state':
+      if (!state.meetingId) {
+        send(socket, { type: 'error', message: 'Join a meeting before sending signalling messages' });
+        return;
+      }
+      await broadcast(state.meetingId, {
+        type: 'state',
+        from: state.userId,
+        payload: message.payload ?? null,
+      });
+      break;
+
     default:
       send(socket, { type: 'error', message: `Unsupported message type "${message.type}"` });
   }
