@@ -1177,6 +1177,74 @@ async function replaceFileContents(
   return toFileView(row);
 }
 
+// ------------------------------------------------------------ chat mirroring
+
+/**
+ * Looks a folder up by name under `parentId` and returns its id, creating it
+ * (as a system folder, same convention as `provisionDefaultFolders`) the
+ * first time. Callers are expected to retry the lookup on a `conflict` from
+ * `createFile` — a concurrent caller can win the same race, which is
+ * expected under at-least-once delivery (see `workers/handlers.ts`'s
+ * "idempotent" doc comment) rather than a bug.
+ */
+async function findOrCreateSystemFolder(actor: Actor, parentId: string | null, name: string): Promise<string> {
+  const scoped = { organizationId: parentId ? null : actor.organizationId, ownerId: parentId ? null : actor.userId };
+
+  const existing = await repository.findFileByNameInFolder({ ...scoped, parentId, name });
+  if (existing && existing.type === 'folder') return existing.id;
+
+  try {
+    const created = await createFile({ actor, name, type: 'folder', parentId, metadata: { system: true } });
+    return created.id;
+  } catch (error) {
+    if (error instanceof AppError && error.code === 'conflict') {
+      const race = await repository.findFileByNameInFolder({ ...scoped, parentId, name });
+      if (race && race.type === 'folder') return race.id;
+    }
+    throw error;
+  }
+}
+
+export interface PlaceChatAttachmentInput {
+  actor: Actor;
+  /** The other party's username for a direct conversation, or the group's title for a group one. */
+  peerLabel: string;
+  direction: 'Sent' | 'Received';
+  filename: string;
+  buffer: Buffer;
+  mimeType: string;
+}
+
+/**
+ * Files a chat attachment into `Chat/<peerLabel>/Sent|Received` in the
+ * actor's own Drive, creating any of those three folders that don't exist
+ * yet. This is how CLAUDE.md §24's domain-event side effects reach into a
+ * different module's data: `workers/handlers.ts`'s `chat.message_sent`
+ * handler calls this once per participant, the same way it already reuses
+ * `purgeStoredObjects` for `file.deleted`.
+ *
+ * Reuses `uploadFile()` for the actual write, so it gets the same quota
+ * accounting, versioning and audit trail as a normal upload — re-filing the
+ * same attachment (an at-least-once redelivery) lands as a new version of
+ * the same file rather than a duplicate, since `uploadFile` already
+ * dedupes by name within a folder.
+ */
+export async function placeChatAttachment(input: PlaceChatAttachmentInput): Promise<FileView> {
+  const peerName = assertValidFileName(input.peerLabel.trim() || 'Unknown');
+
+  const chatFolderId = await findOrCreateSystemFolder(input.actor, null, 'Chat');
+  const peerFolderId = await findOrCreateSystemFolder(input.actor, chatFolderId, peerName);
+  const directionFolderId = await findOrCreateSystemFolder(input.actor, peerFolderId, input.direction);
+
+  return uploadFile({
+    actor: input.actor,
+    parentId: directionFolderId,
+    filename: input.filename,
+    buffer: input.buffer,
+    mimeType: input.mimeType,
+  });
+}
+
 export async function createDownloadUrl(
   actor: Actor,
   fileId: string,

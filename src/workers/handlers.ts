@@ -5,10 +5,11 @@ import { objectKeys } from '../infrastructure/storage/object-storage.js';
 import { objectStorage } from '../infrastructure/storage/s3-object-storage.js';
 import { onEvent } from '../platform/events/event-bus.js';
 import { findFileByIdUnscoped, setContentText } from '../modules/files/files.repository.js';
-import { purgeStoredObjects } from '../modules/files/files.service.js';
+import { placeChatAttachment, purgeStoredObjects } from '../modules/files/files.service.js';
 import { isTextLike } from '../modules/files/files.types.js';
 import { createNotification } from '../modules/notifications/notifications.service.js';
 import { findUserById } from '../modules/identity/identity.repository.js';
+import { findPersonalOrganizationByOwner } from '../modules/organizations/organizations.repository.js';
 
 /**
  * Wiring between domain events and background work (CLAUDE.md §23, §24).
@@ -144,8 +145,8 @@ function registerDomainEventHandlers(): void {
     // The message text, so the notification can show a preview rather than
     // "you have a message" — a system notification the recipient cannot read
     // without opening the app is barely worth raising.
-    const message = await queryOne<{ body: string }>(
-      `SELECT body FROM messages WHERE id = $1 AND deleted_at IS NULL`,
+    const message = await queryOne<{ body: string; attachments: StoredAttachmentPayload[] }>(
+      `SELECT body, attachments FROM messages WHERE id = $1 AND deleted_at IS NULL`,
       [event.payload.messageId],
     );
 
@@ -186,7 +187,115 @@ function registerDomainEventHandlers(): void {
         }),
       );
     }
+
+    // File media messages into everyone's own Drive too (CLAUDE.md §24: the
+    // same event that raised the notifications above also drives this side
+    // effect). Notifications above are skipped for a muted conversation;
+    // this isn't, since muting notifications is not the same as not wanting
+    // the media filed away.
+    if (message.attachments?.length) {
+      await mirrorChatAttachmentsToDrive(
+        event.payload.conversationId,
+        event.payload.senderId,
+        message.attachments,
+      );
+    }
   });
+}
+
+interface StoredAttachmentPayload {
+  id: string;
+  kind: 'voice' | 'image' | 'video' | 'file';
+  name: string;
+  mimeType: string;
+  size: number;
+  storageKey: string;
+  durationSeconds?: number;
+}
+
+/**
+ * Files every attachment on a message into each participant's own Drive —
+ * `Chat/<peer>/Sent` for the sender, `Chat/<peer>/Received` for everyone
+ * else — so media exchanged in a chat is easy to find later without
+ * re-opening the conversation. `<peer>` is the other person's username for a
+ * direct conversation, or the group's title for a group one.
+ *
+ * Best-effort and per-participant: one person's Drive being over quota, or
+ * not having a personal organization to file into, must not stop the others
+ * — the chat message itself is already committed by the time this runs.
+ */
+async function mirrorChatAttachmentsToDrive(
+  conversationId: string,
+  senderId: string,
+  attachments: StoredAttachmentPayload[],
+): Promise<void> {
+  const conversation = await queryOne<{ kind: string; title: string | null }>(
+    `SELECT kind, title FROM conversations WHERE id = $1`,
+    [conversationId],
+  );
+  if (!conversation) return;
+
+  const participants = await queryMany<{ user_id: string; username: string }>(
+    `SELECT cp.user_id, u.username
+       FROM conversation_participants cp
+       JOIN users u ON u.id = cp.user_id
+      WHERE cp.conversation_id = $1`,
+    [conversationId],
+  );
+
+  const sender = participants.find((p) => p.user_id === senderId);
+  const recipients = participants.filter((p) => p.user_id !== senderId);
+  if (!sender) return;
+
+  const isGroup = conversation.kind === 'group';
+  const groupTitle = conversation.title?.trim() || 'Group chat';
+  const sentPeerLabel = isGroup ? groupTitle : recipients[0]?.username ?? 'Unknown';
+  const receivedPeerLabel = isGroup ? groupTitle : sender.username;
+
+  for (const attachment of attachments) {
+    let buffer: Buffer;
+    try {
+      buffer = await objectStorage.getBuffer(attachment.storageKey);
+    } catch (error) {
+      logger().error(
+        { err: error, attachmentId: attachment.id },
+        'failed to read chat attachment for Drive mirroring',
+      );
+      continue;
+    }
+
+    await fileChatAttachmentFor(sender.user_id, sentPeerLabel, 'Sent', attachment, buffer);
+    for (const recipient of recipients) {
+      await fileChatAttachmentFor(recipient.user_id, receivedPeerLabel, 'Received', attachment, buffer);
+    }
+  }
+}
+
+async function fileChatAttachmentFor(
+  userId: string,
+  peerLabel: string,
+  direction: 'Sent' | 'Received',
+  attachment: StoredAttachmentPayload,
+  buffer: Buffer,
+): Promise<void> {
+  try {
+    const org = await findPersonalOrganizationByOwner(userId);
+    if (!org) return;
+
+    await placeChatAttachment({
+      actor: { userId, organizationId: org.id },
+      peerLabel,
+      direction,
+      filename: attachment.name,
+      buffer,
+      mimeType: attachment.mimeType,
+    });
+  } catch (error) {
+    logger().error(
+      { err: error, userId, direction, attachmentId: attachment.id },
+      'failed to mirror chat attachment into Drive',
+    );
+  }
 }
 
 function registerQueueHandlers(): void {
