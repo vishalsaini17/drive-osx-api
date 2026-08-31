@@ -63,6 +63,12 @@ const schema = z.object({
    * Required in production; `load()` refuses to boot without it.
    */
   MAIL_GATEWAY_TOKEN: z.string().optional(),
+  /**
+   * Base URL of drive-osx-mail's outbound relay (POST /deliver), used to hand
+   * off queued outbound mail for real SMTP delivery. Presents
+   * MAIL_GATEWAY_TOKEN the same way inbound delivery does, just in reverse.
+   */
+  MAIL_GATEWAY_URL: z.string().default('http://localhost:2526'),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(100 * 1024 * 1024),
   INLINE_CONTENT_MAX_BYTES: z.coerce.number().int().positive().default(1024 * 1024),
   DEFAULT_STORAGE_QUOTA_BYTES: z.coerce

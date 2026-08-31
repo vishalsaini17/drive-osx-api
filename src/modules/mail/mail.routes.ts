@@ -23,6 +23,7 @@ const sendSchema = z.object({
   to: z.string().trim().min(1, 'Enter at least one recipient'),
   subject: z.string().trim().min(1, 'Subject is required').max(255),
   body: z.string().optional(),
+  bodyHtml: z.string().optional(),
   cc: z.string().trim().optional(),
   bcc: z.string().trim().optional(),
   priority: z.enum(['low', 'normal', 'high']).optional(),
@@ -130,6 +131,15 @@ mailRoutes.get(
     const user = requireUser(req);
     const { emailId } = parseParams(emailParams, req);
     res.json({ email: await service.getEmail(user.id, emailId) });
+  }),
+);
+
+mailRoutes.get(
+  '/:emailId/delivery',
+  asyncHandler(async (req: Request, res: Response) => {
+    const user = requireUser(req);
+    const { emailId } = parseParams(emailParams, req);
+    res.json({ deliveries: await service.listDeliveries(user.id, emailId) });
   }),
 );
 

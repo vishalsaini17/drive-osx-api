@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseRawMessage } from './mail.service.js';
+import { buildRawMessage, isLocalDomain, parseRawMessage, splitAddresses } from './mail.service.js';
 
 describe('parseRawMessage', () => {
   const raw = [
@@ -47,5 +47,92 @@ describe('parseRawMessage', () => {
     expect(parsed.from).toBe('');
     expect(parsed.subject).toBe('');
     expect(parsed.body).toBe('just some text');
+  });
+});
+
+describe('splitAddresses', () => {
+  it('splits comma and semicolon separated recipients', () => {
+    expect(splitAddresses('alice@example.com, bob@example.com; carol@example.com')).toEqual([
+      'alice@example.com',
+      'bob@example.com',
+      'carol@example.com',
+    ]);
+  });
+
+  it('extracts the bare address from a display-name form and lowercases it', () => {
+    expect(splitAddresses('Alice <Alice@Example.com>')).toEqual(['alice@example.com']);
+  });
+
+  it('ignores blank entries and returns an empty array for nothing', () => {
+    expect(splitAddresses('alice@example.com,, ,bob@example.com')).toEqual(['alice@example.com', 'bob@example.com']);
+    expect(splitAddresses('')).toEqual([]);
+    expect(splitAddresses(undefined)).toEqual([]);
+    expect(splitAddresses(null)).toEqual([]);
+  });
+});
+
+describe('isLocalDomain', () => {
+  it('is true for the platform mail domain', () => {
+    expect(isLocalDomain('bob@driveosx.com')).toBe(true);
+  });
+
+  it('is false for any other domain', () => {
+    expect(isLocalDomain('bob@example.com')).toBe(false);
+  });
+
+  it('is false for an address with no domain', () => {
+    expect(isLocalDomain('not-an-address')).toBe(false);
+  });
+});
+
+describe('buildRawMessage', () => {
+  const baseEmail = {
+    id: 'email-1',
+    user_id: 'user-1',
+    message_id: '<fixed-id@driveosx.com>',
+    from_address: 'alice@driveosx.com',
+    to_address: 'bob@example.com',
+    cc_address: null,
+    bcc_address: null,
+    subject: 'Quarterly report',
+    body: 'Plain text body',
+    body_html: null,
+    folder: 'sent' as const,
+    is_unread: false,
+    is_starred: false,
+    is_pinned: false,
+    is_important: false,
+    labels: [],
+    attachments: [],
+    sent_at: new Date('2025-01-01T00:00:00Z'),
+    created_at: new Date('2025-01-01T00:00:00Z'),
+  };
+
+  it('builds a plain-text message when there is no HTML body', async () => {
+    const raw = await buildRawMessage(baseEmail, 'bob@example.com');
+    expect(raw).toContain('From: alice@driveosx.com');
+    expect(raw).toContain('To: bob@example.com');
+    expect(raw).toContain('Subject: Quarterly report');
+    expect(raw).toContain('Message-ID: <fixed-id@driveosx.com>');
+    expect(raw).toContain('Content-Type: text/plain');
+    expect(raw).toContain('Plain text body');
+    expect(raw).not.toContain('multipart');
+  });
+
+  it('wraps text and HTML bodies as multipart/alternative when both are present', async () => {
+    const raw = await buildRawMessage({ ...baseEmail, body_html: '<p>Plain text body</p>' }, 'bob@example.com');
+    expect(raw).toContain('Content-Type: multipart/alternative');
+    expect(raw).toContain('Content-Type: text/plain');
+    expect(raw).toContain('Content-Type: text/html');
+    expect(raw).toContain('<p>Plain text body</p>');
+  });
+
+  it('omits attachments that have no stored bytes rather than referencing missing content', async () => {
+    const raw = await buildRawMessage(
+      { ...baseEmail, attachments: [{ id: 'a1', name: 'notes.txt', size: '10', type: 'text/plain' }] },
+      'bob@example.com',
+    );
+    expect(raw).not.toContain('multipart/mixed');
+    expect(raw).not.toContain('notes.txt');
   });
 });

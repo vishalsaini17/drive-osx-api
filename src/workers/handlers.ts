@@ -8,6 +8,7 @@ import { findFileByIdUnscoped, setContentText } from '../modules/files/files.rep
 import { placeChatAttachment, purgeStoredObjects } from '../modules/files/files.service.js';
 import { isTextLike } from '../modules/files/files.types.js';
 import { createNotification } from '../modules/notifications/notifications.service.js';
+import { deliverQueuedEmail } from '../modules/mail/mail.service.js';
 import { findUserById } from '../modules/identity/identity.repository.js';
 import { findPersonalOrganizationByOwner } from '../modules/organizations/organizations.repository.js';
 
@@ -58,6 +59,19 @@ function registerDomainEventHandlers(): void {
         data: { fileId: file.id, role: event.payload.role },
       }),
     );
+  });
+
+  // Fires only after the transaction that inserted these rows has actually
+  // committed (transactional outbox — see event-bus.ts), so the delivery
+  // rows are guaranteed visible by the time the job runs.
+  onEvent('mail.sent', async (event) => {
+    const queued = await queryMany<{ id: string }>(
+      `SELECT id FROM email_deliveries WHERE email_id = $1 AND status = 'queued'`,
+      [event.payload.emailId],
+    );
+    for (const delivery of queued) {
+      await enqueue('mail.deliver', { deliveryId: delivery.id });
+    }
   });
 
   onEvent('mail.received', async (event) => {
@@ -341,6 +355,10 @@ function registerQueueHandlers(): void {
 
   registerJobHandler<{ storageKeys: string[] }>('file.purge', async ({ storageKeys }) => {
     await purgeStoredObjects(storageKeys);
+  });
+
+  registerJobHandler<{ deliveryId: string }>('mail.deliver', async ({ deliveryId }, job) => {
+    await deliverQueuedEmail(deliveryId, { attempts: job.attempts, maxAttempts: job.maxAttempts });
   });
 
   registerJobHandler<{ userId: string; title: string; body: string; organizationId: string | null }>(
