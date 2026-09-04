@@ -1,12 +1,27 @@
+# Keep the build context small and secrets out of the image.
 node_modules
-.git
-.env
-.env.*
-npm-debug.log*
-coverage
-.cache
 dist
 build
+coverage
+.cache
+
+# Secrets must come from the runtime environment, never be baked into a layer.
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+.vscode
+.idea
+*.log
+npm-debug.log*
 .DS_Store
 Thumbs.db
-*.log
+
+# Not needed at build or runtime.
+*.test.ts
+vitest.config.ts
+README.md
+Dockerfile
+.dockerignore
