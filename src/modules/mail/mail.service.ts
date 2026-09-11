@@ -662,3 +662,67 @@ export async function deliverQueuedEmail(
   if (isFinalAttempt) return;
   throw new Error(errorMessage);
 }
+
+/**
+ * Runs on the `mail.register-sender` queue job, fired once per signup
+ * (`user.registered` handler). Registers the new mailbox address with the
+ * gateway's outbound relay provider — needed because OCI Email Delivery (the
+ * relay in use until outbound port 25 opens) only accepts mail from
+ * addresses explicitly pre-approved in its console, checked against the
+ * message's own `From:` header. Direct-to-MX delivery has no such concept,
+ * so the gateway no-ops this when it isn't relaying through a provider that
+ * needs it — this call is harmless either way.
+ *
+ * Not on the registration critical path: this runs from the background
+ * queue precisely so a slow or momentarily-unavailable relay provider never
+ * blocks or fails signup. Throwing retries with backoff, matching
+ * deliverQueuedEmail above; a user who can already receive mail (inbound
+ * never touches this) just can't send until this eventually succeeds.
+ */
+export async function provisionApprovedSender(
+  emailAddress: string,
+  job: { attempts: number; maxAttempts: number },
+): Promise<void> {
+  const isFinalAttempt = job.attempts + 1 >= job.maxAttempts;
+
+  let response: Response;
+  try {
+    response = await fetch(`${env.MAIL_GATEWAY_URL}/provision-sender`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Mail-Gateway-Token': env.MAIL_GATEWAY_TOKEN ?? '' },
+      body: JSON.stringify({ emailAddress }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    logger().warn({ emailAddress, error: (error as Error).message }, 'sender provisioning request failed');
+    if (isFinalAttempt) {
+      logger().error({ emailAddress }, 'giving up on sender provisioning after final attempt');
+      return;
+    }
+    throw error;
+  }
+
+  if (response.ok) {
+    logger().debug({ emailAddress }, 'sender provisioned (or provisioning not required) with outbound relay');
+    return;
+  }
+
+  const result = (await response.json().catch(() => ({}))) as { error?: string };
+  const errorMessage = result.error ?? `Sender provisioning returned ${response.status}`;
+
+  // Same convention as deliverQueuedEmail: the gateway maps a permanent
+  // rejection to 4xx and a retryable failure (relay unreachable, rate
+  // limited) to 502.
+  const permanent = response.status < 500;
+  if (permanent) {
+    logger().error({ emailAddress, error: errorMessage }, 'sender provisioning permanently rejected');
+    return;
+  }
+
+  logger().warn({ emailAddress, error: errorMessage }, 'sender provisioning failed, will retry');
+  if (isFinalAttempt) {
+    logger().error({ emailAddress }, 'giving up on sender provisioning after final attempt');
+    return;
+  }
+  throw new Error(errorMessage);
+}

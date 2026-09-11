@@ -8,7 +8,8 @@ import { findFileByIdUnscoped, setContentText } from '../modules/files/files.rep
 import { placeChatAttachment, purgeStoredObjects } from '../modules/files/files.service.js';
 import { isTextLike } from '../modules/files/files.types.js';
 import { createNotification } from '../modules/notifications/notifications.service.js';
-import { deliverQueuedEmail } from '../modules/mail/mail.service.js';
+import { deliverQueuedEmail, provisionApprovedSender } from '../modules/mail/mail.service.js';
+import { env } from '../platform/configuration/env.js';
 import { findUserById } from '../modules/identity/identity.repository.js';
 import { findPersonalOrganizationByOwner } from '../modules/organizations/organizations.repository.js';
 
@@ -98,6 +99,8 @@ function registerDomainEventHandlers(): void {
         data: {},
       }),
     );
+
+    await enqueue('mail.register-sender', { emailAddress: `${event.payload.username}@${env.MAIL_DOMAIN}` });
   });
 
   onEvent('organization.member_added', async (event) => {
@@ -359,6 +362,10 @@ function registerQueueHandlers(): void {
 
   registerJobHandler<{ deliveryId: string }>('mail.deliver', async ({ deliveryId }, job) => {
     await deliverQueuedEmail(deliveryId, { attempts: job.attempts, maxAttempts: job.maxAttempts });
+  });
+
+  registerJobHandler<{ emailAddress: string }>('mail.register-sender', async ({ emailAddress }, job) => {
+    await provisionApprovedSender(emailAddress, { attempts: job.attempts, maxAttempts: job.maxAttempts });
   });
 
   registerJobHandler<{ userId: string; title: string; body: string; organizationId: string | null }>(

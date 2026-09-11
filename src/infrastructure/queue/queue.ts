@@ -16,6 +16,7 @@ export type JobName =
   | 'file.index'
   | 'file.purge'
   | 'mail.deliver'
+  | 'mail.register-sender'
   | 'notification.dispatch'
   | 'audit.write';
 
